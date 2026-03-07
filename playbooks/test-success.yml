@@ -1,0 +1,28 @@
+---
+# Kubernaut E2E Test Playbook: Success Path
+# Used by: E2E-WE-015-001, E2E-WE-016-001, E2E-FP-015-001
+#
+# Simulates a successful remediation action.
+# Runs on localhost (connection: local) since AWX EE doesn't need
+# SSH access to the Kind cluster for validation purposes.
+
+- name: Kubernaut E2E Success Playbook
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Log remediation parameters
+      ansible.builtin.debug:
+        msg: >-
+          Kubernaut remediation executing:
+          target={{ target_kind | default('unknown') }}/{{ target_name | default('unknown') }}
+          in namespace={{ target_namespace | default('default') }}
+
+    - name: Simulate remediation work
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: "Remediation completed successfully"

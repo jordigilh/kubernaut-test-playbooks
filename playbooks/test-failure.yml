@@ -1,0 +1,22 @@
+---
+# Kubernaut E2E Test Playbook: Failure Path
+# Used by: E2E-WE-015-002
+#
+# Simulates a failed remediation action for failure-path testing.
+
+- name: Kubernaut E2E Failure Playbook
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Log remediation parameters
+      ansible.builtin.debug:
+        msg: >-
+          Kubernaut remediation executing (will fail):
+          target={{ target_kind | default('unknown') }}/{{ target_name | default('unknown') }}
+          in namespace={{ target_namespace | default('default') }}
+
+    - name: Simulate remediation failure
+      ansible.builtin.fail:
+        msg: "Intentional failure for Kubernaut E2E testing (E2E-WE-015-002)"

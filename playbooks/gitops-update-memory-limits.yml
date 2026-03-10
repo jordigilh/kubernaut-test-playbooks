@@ -1,0 +1,202 @@
+---
+# Kubernaut Ansible Playbook: GitOps Memory Limits Update
+# Issue #312: Increase memory limits by committing updated YAML to a GitOps repo.
+#
+# Required extra_vars (injected by WFE controller):
+#   TARGET_NAMESPACE   - Namespace of the affected deployment
+#   TARGET_DEPLOYMENT  - Name of the deployment
+#   NEW_MEMORY_LIMIT   - New memory limit value (e.g., "512Mi")
+#   WFE_NAME           - WorkflowExecution name (for RR lookup)
+#   WFE_NAMESPACE      - WorkflowExecution namespace
+#
+# The playbook:
+#   1. Validates the new limit > current limit
+#   2. Discovers the ArgoCD Application and Git repo URL
+#   3. Discovers the parent RemediationRequest name via the WFE
+#   4. Clones the repo, updates the deployment YAML, commits with RR ref, pushes
+#
+# The playbook exits after push. The RO/EA pipeline handles post-remediation
+# verification (hash drift, alert resolution, ArgoCD sync).
+
+- name: GitOps Memory Limits Update
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    git_creds_dir: "/run/kubernaut/secrets/gitea-repo-creds"
+
+  tasks:
+    # ── Phase 1: Validate ──────────────────────────────────────────────────
+
+    - name: Validate required parameters
+      ansible.builtin.assert:
+        that:
+          - TARGET_NAMESPACE is defined and TARGET_NAMESPACE | length > 0
+          - TARGET_DEPLOYMENT is defined and TARGET_DEPLOYMENT | length > 0
+          - NEW_MEMORY_LIMIT is defined and NEW_MEMORY_LIMIT | length > 0
+          - WFE_NAME is defined and WFE_NAME | length > 0
+          - WFE_NAMESPACE is defined and WFE_NAMESPACE | length > 0
+        fail_msg: "Missing required extra_vars"
+
+    - name: Get current deployment memory limit
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ TARGET_DEPLOYMENT }}"
+        namespace: "{{ TARGET_NAMESPACE }}"
+      register: deployment_info
+
+    - name: Extract current memory limit
+      ansible.builtin.set_fact:
+        current_memory_limit: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].resources.limits.memory
+             | default('0Mi') }}
+
+    - name: Log memory comparison
+      ansible.builtin.debug:
+        msg: "Current: {{ current_memory_limit }} -> New: {{ NEW_MEMORY_LIMIT }}"
+
+    # ── Phase 2: Discover ArgoCD Application ───────────────────────────────
+
+    - name: Find ArgoCD Application targeting namespace
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: argocd
+      register: argocd_apps
+
+    - name: Extract repo URL and branch from ArgoCD Application
+      ansible.builtin.set_fact:
+        git_repo_url: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.repoURL }}
+        git_branch_raw: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.targetRevision | default('main') }}
+        git_repo_path: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.path | default('') }}
+
+    - name: Normalize branch name
+      ansible.builtin.set_fact:
+        git_branch: "{{ 'main' if (git_branch_raw == 'HEAD' or git_branch_raw == '') else git_branch_raw }}"
+
+    - name: Log discovered ArgoCD info
+      ansible.builtin.debug:
+        msg: "ArgoCD: repo={{ git_repo_url }} branch={{ git_branch }} path={{ git_repo_path }}"
+
+    # ── Phase 3: Discover parent RemediationRequest ────────────────────────
+
+    - name: Look up WorkflowExecution to find parent RR
+      kubernetes.core.k8s_info:
+        api_version: kubernaut.ai/v1alpha1
+        kind: WorkflowExecution
+        name: "{{ WFE_NAME }}"
+        namespace: "{{ WFE_NAMESPACE }}"
+      register: wfe_info
+
+    - name: Extract RR name from WFE ownerReferences
+      ansible.builtin.set_fact:
+        rr_name: >-
+          {{ (wfe_info.resources[0].metadata.ownerReferences
+              | selectattr('kind', 'equalto', 'RemediationRequest')
+              | first).name | default('unknown-rr') }}
+      when: wfe_info.resources | length > 0
+
+    - name: Fallback RR name
+      ansible.builtin.set_fact:
+        rr_name: "unknown-rr"
+      when: rr_name is not defined
+
+    - name: Log RR name
+      ansible.builtin.debug:
+        msg: "Parent RemediationRequest: {{ rr_name }}"
+
+    # ── Phase 4: Clone, update, commit, push ───────────────────────────────
+
+    - name: Read Git credentials from mounted Secret
+      ansible.builtin.set_fact:
+        git_username: "{{ lookup('file', git_creds_dir + '/username') }}"
+        git_password: "{{ lookup('file', git_creds_dir + '/password') }}"
+
+    - name: Build authenticated repo URL
+      ansible.builtin.set_fact:
+        auth_repo_url: "{{ git_repo_url | regex_replace('://', '://' + git_username + ':' + git_password + '@') }}"
+
+    - name: Create temp work directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: kubernaut-gitops-
+      register: work_dir
+
+    - name: Clone repository
+      ansible.builtin.git:
+        repo: "{{ auth_repo_url }}"
+        dest: "{{ work_dir.path }}/repo"
+        version: "{{ git_branch }}"
+        force: true
+
+    - name: Configure git identity
+      ansible.builtin.shell: |
+        git config user.email "kubernaut-remediation@kubernaut.ai"
+        git config user.name "Kubernaut Remediation"
+      args:
+        chdir: "{{ work_dir.path }}/repo"
+
+    - name: Find deployment YAML in repo
+      ansible.builtin.find:
+        paths: "{{ work_dir.path }}/repo/{{ git_repo_path }}"
+        patterns: "*.yaml,*.yml"
+        contains: "kind: Deployment"
+        recurse: true
+      register: yaml_files
+
+    - name: Update memory limits in deployment YAML
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '(memory:\s*")[^"]*(")'
+        replace: '\g<1>{{ NEW_MEMORY_LIMIT }}\g<2>'
+      loop: "{{ yaml_files.files }}"
+      when: yaml_files.matched > 0
+
+    - name: Update memory limits (unquoted format)
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '(memory:\s*)"\d+\w+"'
+        replace: '\1"{{ NEW_MEMORY_LIMIT }}"'
+      loop: "{{ yaml_files.files }}"
+      when: yaml_files.matched > 0
+
+    - name: Commit and push
+      ansible.builtin.shell: |
+        git add -A
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        git commit -m "remediation({{ rr_name }}): increase memory limits to {{ NEW_MEMORY_LIMIT }}"
+        git push origin {{ git_branch }}
+      args:
+        chdir: "{{ work_dir.path }}/repo"
+      register: git_push_result
+
+    - name: Log result
+      ansible.builtin.debug:
+        msg: "{{ git_push_result.stdout_lines | default(['Push complete']) }}"
+
+    - name: Cleanup work directory
+      ansible.builtin.file:
+        path: "{{ work_dir.path }}"
+        state: absent
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: >-
+          Memory limits updated to {{ NEW_MEMORY_LIMIT }} for
+          {{ TARGET_DEPLOYMENT }} in {{ TARGET_NAMESPACE }}.
+          Commit references RR {{ rr_name }}.
+          ArgoCD will reconcile the change.

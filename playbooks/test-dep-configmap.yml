@@ -1,0 +1,31 @@
+---
+# Kubernaut Test Playbook: Validate ConfigMap Dependency Injection
+# Issue #312: E2E test for dependencies.configMaps via AWX extra_vars
+#
+# This playbook validates that the Kubernaut WFE controller correctly injects
+# K8s ConfigMap data as AWX extra_vars.
+#
+# Expected extra_var (from ConfigMap "e2e-dep-configmap-ansible" with key "setting"):
+#   KUBERNAUT_CONFIGMAP_E2E_DEP_CONFIGMAP_ANSIBLE_SETTING
+
+- name: Validate ConfigMap Dependency Injection
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Validate ConfigMap data was injected as extra_var
+      ansible.builtin.assert:
+        that:
+          - KUBERNAUT_CONFIGMAP_E2E_DEP_CONFIGMAP_ANSIBLE_SETTING is defined
+          - KUBERNAUT_CONFIGMAP_E2E_DEP_CONFIGMAP_ANSIBLE_SETTING | length > 0
+        fail_msg: "KUBERNAUT_CONFIGMAP_E2E_DEP_CONFIGMAP_ANSIBLE_SETTING extra_var not injected or empty"
+        success_msg: "ConfigMap dependency injection validated successfully"
+
+    - name: Log injected value
+      ansible.builtin.debug:
+        msg: "E2E-WE-015-006: ConfigMap value = {{ KUBERNAUT_CONFIGMAP_E2E_DEP_CONFIGMAP_ANSIBLE_SETTING }}"
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg: "E2E-WE-015-006: ConfigMap dependency injection via extra_vars verified"

@@ -9,6 +9,10 @@
 #   WFE_NAME           - WorkflowExecution name (for RR lookup)
 #   WFE_NAMESPACE      - WorkflowExecution namespace
 #
+# Required AWX credential env vars (injected via dependencies.secrets):
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password
+#
 # The playbook:
 #   1. Validates the new limit > current limit
 #   2. Discovers the ArgoCD Application and Git repo URL
@@ -22,9 +26,6 @@
   hosts: localhost
   connection: local
   gather_facts: false
-
-  vars:
-    git_creds_dir: "/run/kubernaut/secrets/gitea-repo-creds"
 
   tasks:
     # ── Phase 1: Validate ──────────────────────────────────────────────────
@@ -118,14 +119,16 @@
 
     # ── Phase 4: Clone, update, commit, push ───────────────────────────────
 
-    - name: Read Git credentials from mounted Secret
+    - name: Read Git credentials from AWX credential env vars
       ansible.builtin.set_fact:
-        git_username: "{{ lookup('file', git_creds_dir + '/username') }}"
-        git_password: "{{ lookup('file', git_creds_dir + '/password') }}"
+        git_username: "{{ lookup('env', 'KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME') }}"
+        git_password: "{{ lookup('env', 'KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD') }}"
+      no_log: true
 
     - name: Build authenticated repo URL
       ansible.builtin.set_fact:
         auth_repo_url: "{{ git_repo_url | regex_replace('://', '://' + git_username + ':' + git_password + '@') }}"
+      no_log: true
 
     - name: Create temp work directory
       ansible.builtin.tempfile:
@@ -139,6 +142,7 @@
         dest: "{{ work_dir.path }}/repo"
         version: "{{ git_branch }}"
         force: true
+      no_log: true
 
     - name: Configure git identity
       ansible.builtin.shell: |

@@ -1,0 +1,629 @@
+---
+# Kubernaut Ansible Playbook: Migrate emptyDir Database to PVC via GitOps
+# Issue #324: DiskPressure from emptyDir growth -> backup, GitOps migration, restore
+#
+# Required extra_vars (injected by WFE controller):
+#   TARGET_NAMESPACE   - Namespace of the affected deployment
+#   TARGET_DEPLOYMENT  - Name of the deployment using emptyDir
+#   NODE_NAME          - Name of the node reporting DiskPressure
+#   PVC_SIZE           - Size for the new PVC (default: "2Gi")
+#   STORAGE_CLASS      - StorageClass for the new PVC (default: cluster default)
+#   WFE_NAME           - WorkflowExecution name (for RR lookup)
+#   WFE_NAMESPACE      - WorkflowExecution namespace
+#
+# Required AWX credential env vars (injected via dependencies.secrets):
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password
+#
+# The playbook:
+#   1. Cordons the affected node to prevent scheduling
+#   2. Discovers DB credentials from the Deployment's Secret references
+#   3. Backs up the database via pg_dump to a temporary PVC on a healthy node
+#   4. Commits the emptyDir->PVC migration to the GitOps repo (ArgoCD syncs)
+#   5. Restores the database from the backup
+#   6. Uncordons the node and verifies DiskPressure resolves
+#
+# Each phase uses block/rescue for safe rollback on failure.
+
+- name: "Migrate emptyDir Database to Persistent Storage (GitOps)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    pvc_size: "{{ PVC_SIZE | default('2Gi') }}"
+    storage_class: "{{ STORAGE_CLASS | default('') }}"
+    backup_pvc_name: "postgres-emergency-backup"
+    permanent_pvc_name: "postgres-data"
+
+  tasks:
+
+    # ── Validate required parameters ────────────────────────────────────────
+
+    - name: Validate required parameters
+      ansible.builtin.assert:
+        that:
+          - TARGET_NAMESPACE is defined and TARGET_NAMESPACE | length > 0
+          - TARGET_DEPLOYMENT is defined and TARGET_DEPLOYMENT | length > 0
+          - NODE_NAME is defined and NODE_NAME | length > 0
+          - WFE_NAME is defined and WFE_NAME | length > 0
+          - WFE_NAMESPACE is defined and WFE_NAMESPACE | length > 0
+        fail_msg: "Missing required extra_vars"
+
+    # ── Discover deployment, image, and DB credentials ──────────────────────
+
+    - name: Get target deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ TARGET_DEPLOYMENT }}"
+        namespace: "{{ TARGET_NAMESPACE }}"
+      register: deployment_info
+
+    - name: Fail if deployment not found
+      ansible.builtin.fail:
+        msg: "Deployment {{ TARGET_DEPLOYMENT }} not found in {{ TARGET_NAMESPACE }}"
+      when: deployment_info.resources | length == 0
+
+    - name: Extract container image for backup/restore Jobs
+      ansible.builtin.set_fact:
+        pg_image: "{{ deployment_info.resources[0].spec.template.spec.containers[0].image }}"
+
+    - name: Log discovered image
+      ansible.builtin.debug:
+        msg: "Using image from Deployment: {{ pg_image }}"
+
+    - name: Extract DB credentials from Deployment env Secret references
+      ansible.builtin.set_fact:
+        db_password_secret_name: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
+             | selectattr('name', 'equalto', 'POSTGRES_PASSWORD')
+             | map(attribute='valueFrom.secretKeyRef.name')
+             | first | default('') }}
+        db_password_secret_key: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
+             | selectattr('name', 'equalto', 'POSTGRES_PASSWORD')
+             | map(attribute='valueFrom.secretKeyRef.key')
+             | first | default('password') }}
+        db_user: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
+             | selectattr('name', 'equalto', 'POSTGRES_USER')
+             | map(attribute='value')
+             | first | default('postgres') }}
+        db_name: >-
+          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
+             | selectattr('name', 'equalto', 'POSTGRES_DB')
+             | map(attribute='value')
+             | first | default('postgres') }}
+
+    - name: Read DB password from Secret
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "{{ db_password_secret_name }}"
+        namespace: "{{ TARGET_NAMESPACE }}"
+      register: db_secret
+      when: db_password_secret_name | length > 0
+      no_log: true
+
+    - name: Decode DB password
+      ansible.builtin.set_fact:
+        db_password: "{{ db_secret.resources[0].data[db_password_secret_key] | b64decode }}"
+      when: db_password_secret_name | length > 0
+      no_log: true
+
+    - name: Fallback to trust auth if no Secret
+      ansible.builtin.set_fact:
+        db_password: ""
+      when: db_password_secret_name | length == 0
+
+    # ── Discover parent RemediationRequest ────────────────────────────────
+
+    - name: Look up WorkflowExecution to find parent RR
+      kubernetes.core.k8s_info:
+        api_version: kubernaut.ai/v1alpha1
+        kind: WorkflowExecution
+        name: "{{ WFE_NAME }}"
+        namespace: "{{ WFE_NAMESPACE }}"
+      register: wfe_info
+
+    - name: Extract RR name from WFE ownerReferences
+      ansible.builtin.set_fact:
+        rr_name: >-
+          {{ (wfe_info.resources[0].metadata.ownerReferences
+              | selectattr('kind', 'equalto', 'RemediationRequest')
+              | first).name | default('unknown-rr') }}
+      when: wfe_info.resources | length > 0
+
+    - name: Fallback RR name
+      ansible.builtin.set_fact:
+        rr_name: "unknown-rr"
+      when: rr_name is not defined
+
+    # ── Discover ArgoCD Application ───────────────────────────────────────
+
+    - name: Find ArgoCD Application targeting namespace
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: argocd
+      register: argocd_apps
+
+    - name: Extract repo URL and branch from ArgoCD Application
+      ansible.builtin.set_fact:
+        git_repo_url: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.repoURL }}
+        git_branch_raw: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.targetRevision | default('main') }}
+        git_repo_path: >-
+          {{ (argocd_apps.resources
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | first).spec.source.path | default('') }}
+
+    - name: Normalize branch name
+      ansible.builtin.set_fact:
+        git_branch: "{{ 'main' if (git_branch_raw == 'HEAD' or git_branch_raw == '') else git_branch_raw }}"
+
+    - name: Log discovered info
+      ansible.builtin.debug:
+        msg: >-
+          DB: {{ db_user }}@{{ db_name }} | Image: {{ pg_image }} |
+          ArgoCD: repo={{ git_repo_url }} branch={{ git_branch }} path={{ git_repo_path }} |
+          RR: {{ rr_name }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 1: Stabilize -- cordon the affected node
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: "Phase 1: Cordon affected node"
+      kubernetes.core.k8s_drain:
+        name: "{{ NODE_NAME }}"
+        state: cordon
+
+    - name: Verify node is cordoned
+      kubernetes.core.k8s_info:
+        kind: Node
+        name: "{{ NODE_NAME }}"
+      register: node_info
+      failed_when: not node_info.resources[0].spec.unschedulable
+
+    - name: Log Phase 1 complete
+      ansible.builtin.debug:
+        msg: "Phase 1 complete: node {{ NODE_NAME }} cordoned"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 2: Backup -- pg_dump to a temporary PVC on a healthy node
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: "Phase 2: Backup database"
+      block:
+        - name: Determine StorageClass for PVCs
+          ansible.builtin.set_fact:
+            target_storage_class: "{{ storage_class if storage_class | length > 0 else omit }}"
+
+        - name: Create backup PVC
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: "{{ backup_pvc_name }}"
+                namespace: "{{ TARGET_NAMESPACE }}"
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: "{{ target_storage_class | default(omit) }}"
+                resources:
+                  requests:
+                    storage: "{{ pvc_size }}"
+
+        - name: Build PGPASSWORD env section
+          ansible.builtin.set_fact:
+            pgpassword_env: >-
+              {{ [{'name': 'PGPASSWORD', 'value': db_password}] if db_password | length > 0 else [] }}
+          no_log: true
+
+        - name: Run pg_dump Job
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: postgres-backup
+                namespace: "{{ TARGET_NAMESPACE }}"
+              spec:
+                backoffLimit: 0
+                template:
+                  spec:
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: kubernetes.io/hostname
+                                  operator: NotIn
+                                  values: ["{{ NODE_NAME }}"]
+                    containers:
+                      - name: backup
+                        image: "{{ pg_image }}"
+                        command: ["sh", "-c"]
+                        args:
+                          - |
+                            pg_dump -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                              -U {{ db_user }} -Fc {{ db_name }} > /backup/dump.pgdump
+                            echo "Backup complete. Size: $(du -sh /backup/dump.pgdump | cut -f1)"
+                        env: "{{ pgpassword_env }}"
+                        volumeMounts:
+                          - name: backup-vol
+                            mountPath: /backup
+                    volumes:
+                      - name: backup-vol
+                        persistentVolumeClaim:
+                          claimName: "{{ backup_pvc_name }}"
+                    restartPolicy: Never
+
+        - name: Wait for backup Job to complete
+          kubernetes.core.k8s_info:
+            kind: Job
+            name: postgres-backup
+            namespace: "{{ TARGET_NAMESPACE }}"
+          register: backup_job
+          until: >-
+            (backup_job.resources[0].status.succeeded | default(0)) == 1
+            or (backup_job.resources[0].status.failed | default(0)) > 0
+          retries: 60
+          delay: 10
+
+        - name: Fail if backup Job did not succeed
+          ansible.builtin.fail:
+            msg: "pg_dump Job failed"
+          when: (backup_job.resources[0].status.succeeded | default(0)) != 1
+
+        - name: Verify backup integrity
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: postgres-backup-verify
+                namespace: "{{ TARGET_NAMESPACE }}"
+              spec:
+                backoffLimit: 0
+                template:
+                  spec:
+                    containers:
+                      - name: verify
+                        image: "{{ pg_image }}"
+                        command: ["pg_restore", "--list", "/backup/dump.pgdump"]
+                        volumeMounts:
+                          - name: backup-vol
+                            mountPath: /backup
+                    volumes:
+                      - name: backup-vol
+                        persistentVolumeClaim:
+                          claimName: "{{ backup_pvc_name }}"
+                    restartPolicy: Never
+
+        - name: Wait for verification Job
+          kubernetes.core.k8s_info:
+            kind: Job
+            name: postgres-backup-verify
+            namespace: "{{ TARGET_NAMESPACE }}"
+          register: verify_job
+          until: >-
+            (verify_job.resources[0].status.succeeded | default(0)) == 1
+            or (verify_job.resources[0].status.failed | default(0)) > 0
+          retries: 20
+          delay: 5
+
+        - name: Fail if verification did not succeed
+          ansible.builtin.fail:
+            msg: "Backup verification failed -- dump may be corrupt"
+          when: (verify_job.resources[0].status.succeeded | default(0)) != 1
+
+        - name: Log Phase 2 complete
+          ansible.builtin.debug:
+            msg: "Phase 2 complete: database backed up and verified"
+
+      rescue:
+        - name: "RESCUE Phase 2: uncordon node and abort"
+          kubernetes.core.k8s_drain:
+            name: "{{ NODE_NAME }}"
+            state: uncordon
+          ignore_errors: true
+        - ansible.builtin.fail:
+            msg: >-
+              Backup failed. Node {{ NODE_NAME }} uncordoned.
+              Original pod and emptyDir data are intact.
+              Manual intervention required.
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 3: GitOps migration -- commit emptyDir->PVC to Git
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: "Phase 3: Commit migration to Git repo"
+      block:
+        - name: Read Git credentials from AWX credential env vars
+          ansible.builtin.set_fact:
+            git_username: "{{ lookup('env', 'KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME') }}"
+            git_password: "{{ lookup('env', 'KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD') }}"
+          no_log: true
+
+        - name: Build authenticated repo URL
+          ansible.builtin.set_fact:
+            auth_repo_url: "{{ git_repo_url | regex_replace('://', '://' + git_username + ':' + git_password + '@') }}"
+          no_log: true
+
+        - name: Create temp work directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: kubernaut-migrate-
+          register: work_dir
+
+        - name: Clone repository
+          ansible.builtin.git:
+            repo: "{{ auth_repo_url }}"
+            dest: "{{ work_dir.path }}/repo"
+            version: "{{ git_branch }}"
+            force: true
+          no_log: true
+
+        - name: Configure git identity
+          ansible.builtin.shell: |
+            git config user.email "kubernaut-remediation@kubernaut.ai"
+            git config user.name "Kubernaut Remediation"
+          args:
+            chdir: "{{ work_dir.path }}/repo"
+
+        - name: Determine manifest path in repo
+          ansible.builtin.set_fact:
+            repo_manifest_path: "{{ work_dir.path }}/repo/{{ git_repo_path }}"
+
+        - name: Add PVC manifest to repo
+          ansible.builtin.copy:
+            dest: "{{ repo_manifest_path }}/postgres-data-pvc.yaml"
+            content: |
+              apiVersion: v1
+              kind: PersistentVolumeClaim
+              metadata:
+                name: {{ permanent_pvc_name }}
+                namespace: {{ TARGET_NAMESPACE }}
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                {{ 'storageClassName: ' + storage_class if storage_class | length > 0 else '' }}
+                resources:
+                  requests:
+                    storage: {{ pvc_size }}
+
+        - name: Patch Deployment YAML -- replace emptyDir with PVC
+          ansible.builtin.replace:
+            path: "{{ item.path }}"
+            regexp: 'emptyDir:\s*\{\}'
+            replace: |-
+              persistentVolumeClaim:
+                    claimName: {{ permanent_pvc_name }}
+          loop: "{{ deployment_files.files }}"
+          vars:
+            deployment_files: "{{ lookup('pipe', 'find ' + repo_manifest_path + ' -name \"*.yaml\" -exec grep -l \"kind: Deployment\" {} +') }}"
+          when: false
+
+        - name: Find deployment YAML files in repo
+          ansible.builtin.find:
+            paths: "{{ repo_manifest_path }}"
+            patterns: "*.yaml,*.yml"
+            contains: "kind: Deployment"
+            recurse: true
+          register: deployment_yaml_files
+
+        - name: Patch Deployment YAML -- replace emptyDir with PVC
+          ansible.builtin.replace:
+            path: "{{ item.path }}"
+            regexp: 'emptyDir:\s*\{\}'
+            replace: |-
+              persistentVolumeClaim:
+                    claimName: {{ permanent_pvc_name }}
+          loop: "{{ deployment_yaml_files.files }}"
+          when: deployment_yaml_files.matched > 0
+
+        - name: Add PVC to kustomization.yaml if present
+          ansible.builtin.lineinfile:
+            path: "{{ repo_manifest_path }}/kustomization.yaml"
+            line: "  - postgres-data-pvc.yaml"
+            insertafter: "resources:"
+          ignore_errors: true
+
+        - name: Commit and push
+          ansible.builtin.shell: |
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No changes to commit"
+              exit 0
+            fi
+            git commit -m "remediation({{ rr_name }}): migrate {{ TARGET_DEPLOYMENT }} from emptyDir to PVC
+
+            Automated remediation by Kubernaut.
+            Root cause: emptyDir growth on {{ TARGET_DEPLOYMENT }} caused
+            KubeNodeDiskPressure on node {{ NODE_NAME }}.
+            Action: replaced emptyDir volume with PVC ({{ pvc_size }})."
+            git push origin {{ git_branch }}
+          args:
+            chdir: "{{ work_dir.path }}/repo"
+          register: git_push_result
+
+        - name: Log git result
+          ansible.builtin.debug:
+            msg: "{{ git_push_result.stdout_lines | default(['Push complete']) }}"
+
+        - name: Cleanup work directory
+          ansible.builtin.file:
+            path: "{{ work_dir.path }}"
+            state: absent
+
+        - name: Wait for ArgoCD sync and healthy rollout
+          kubernetes.core.k8s_info:
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            namespace: argocd
+          register: argo_apps_status
+          until: >-
+            (argo_apps_status.resources
+             | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+             | map(attribute='status.sync.status') | first | default('')) == 'Synced'
+            and
+            (argo_apps_status.resources
+             | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+             | map(attribute='status.health.status') | first | default('')) == 'Healthy'
+          retries: 60
+          delay: 10
+
+        - name: Verify new pod is running with PVC
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ TARGET_NAMESPACE }}"
+            label_selectors:
+              - "app={{ TARGET_DEPLOYMENT }}"
+          register: new_pods
+          until: >-
+            new_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
+          retries: 30
+          delay: 5
+
+        - name: Log Phase 3 complete
+          ansible.builtin.debug:
+            msg: "Phase 3 complete: migration committed to Git and synced by ArgoCD"
+
+      rescue:
+        - name: Cleanup work directory on failure
+          ansible.builtin.file:
+            path: "{{ work_dir.path | default('/tmp/kubernaut-migrate-nonexistent') }}"
+            state: absent
+          ignore_errors: true
+        - ansible.builtin.fail:
+            msg: >-
+              GitOps migration failed.
+              Backup is preserved at PVC {{ backup_pvc_name }} in {{ TARGET_NAMESPACE }}.
+              Node {{ NODE_NAME }} remains cordoned. Manual intervention required.
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 4: Restore -- pg_restore to the new PVC-backed instance
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: "Phase 4: Restore database"
+      block:
+        - name: Run pg_restore Job
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: batch/v1
+              kind: Job
+              metadata:
+                name: postgres-restore
+                namespace: "{{ TARGET_NAMESPACE }}"
+              spec:
+                backoffLimit: 0
+                template:
+                  spec:
+                    containers:
+                      - name: restore
+                        image: "{{ pg_image }}"
+                        command: ["sh", "-c"]
+                        args:
+                          - |
+                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }}; do
+                              sleep 2
+                            done
+                            pg_restore -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                              -U {{ db_user }} -d {{ db_name }} --clean --if-exists /backup/dump.pgdump
+                            echo "Restore complete. Row count:"
+                            psql -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                              -U {{ db_user }} -d {{ db_name }} -c "SELECT count(*) FROM events;"
+                        env: "{{ pgpassword_env }}"
+                        volumeMounts:
+                          - name: backup-vol
+                            mountPath: /backup
+                    volumes:
+                      - name: backup-vol
+                        persistentVolumeClaim:
+                          claimName: "{{ backup_pvc_name }}"
+                    restartPolicy: Never
+
+        - name: Wait for restore Job to complete
+          kubernetes.core.k8s_info:
+            kind: Job
+            name: postgres-restore
+            namespace: "{{ TARGET_NAMESPACE }}"
+          register: restore_job
+          until: >-
+            (restore_job.resources[0].status.succeeded | default(0)) == 1
+            or (restore_job.resources[0].status.failed | default(0)) > 0
+          retries: 60
+          delay: 10
+
+        - name: Fail if restore did not succeed
+          ansible.builtin.fail:
+            msg: "pg_restore Job failed"
+          when: (restore_job.resources[0].status.succeeded | default(0)) != 1
+
+        - name: Log Phase 4 complete
+          ansible.builtin.debug:
+            msg: "Phase 4 complete: database restored to PVC-backed instance"
+
+      rescue:
+        - ansible.builtin.debug:
+            msg: >-
+              Restore failed. Backup preserved at PVC {{ backup_pvc_name }}
+              in {{ TARGET_NAMESPACE }}. Manual pg_restore required.
+        - ansible.builtin.fail:
+            msg: "Phase 4 (restore) failed. See above for backup PVC location."
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Phase 5: Cleanup -- uncordon, verify, delete temp resources
+    # ══════════════════════════════════════════════════════════════════════
+
+    - name: "Phase 5: Cleanup and verify"
+      block:
+        - name: Uncordon node
+          kubernetes.core.k8s_drain:
+            name: "{{ NODE_NAME }}"
+            state: uncordon
+
+        - name: Wait for DiskPressure to resolve
+          kubernetes.core.k8s_info:
+            kind: Node
+            name: "{{ NODE_NAME }}"
+          register: node_status
+          until: >-
+            node_status.resources[0].status.conditions
+            | selectattr('type', 'equalto', 'DiskPressure')
+            | map(attribute='status') | first == 'False'
+          retries: 60
+          delay: 10
+
+        - name: Delete temporary backup resources
+          kubernetes.core.k8s:
+            state: absent
+            kind: "{{ item.kind }}"
+            name: "{{ item.name }}"
+            namespace: "{{ TARGET_NAMESPACE }}"
+          loop:
+            - { kind: Job, name: postgres-backup }
+            - { kind: Job, name: postgres-backup-verify }
+            - { kind: Job, name: postgres-restore }
+            - { kind: PersistentVolumeClaim, name: "{{ backup_pvc_name }}" }
+          ignore_errors: true
+
+        - name: Report success
+          ansible.builtin.debug:
+            msg: >-
+              Migration complete.
+              Deployment: {{ TARGET_DEPLOYMENT }} in {{ TARGET_NAMESPACE }}
+              Storage: PVC {{ permanent_pvc_name }} ({{ pvc_size }})
+              Node: {{ NODE_NAME }} uncordoned, DiskPressure resolved
+              Git commit: remediation for {{ rr_name }}

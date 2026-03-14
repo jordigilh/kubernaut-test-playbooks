@@ -10,6 +10,7 @@
 #   STORAGE_CLASS      - StorageClass for the new PVC (default: cluster default)
 #   WFE_NAME           - WorkflowExecution name (for RR lookup)
 #   WFE_NAMESPACE      - WorkflowExecution namespace
+#   ARGOCD_NAMESPACE   - Namespace where ArgoCD Applications live (default: "argocd", OCP: "openshift-gitops")
 #
 # Required AWX credential env vars (injected via dependencies.secrets):
 #   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
@@ -33,6 +34,7 @@
   vars:
     pvc_size: "{{ PVC_SIZE | default('2Gi') }}"
     storage_class: "{{ STORAGE_CLASS | default('') }}"
+    argocd_namespace: "{{ ARGOCD_NAMESPACE | default('argocd') }}"
     backup_pvc_name: "postgres-emergency-backup"
     permanent_pvc_name: "postgres-data"
 
@@ -146,7 +148,7 @@
       kubernetes.core.k8s_info:
         api_version: argoproj.io/v1alpha1
         kind: Application
-        namespace: argocd
+        namespace: "{{ argocd_namespace }}"
       register: argocd_apps
 
     - name: Extract repo URL and branch from ArgoCD Application
@@ -470,7 +472,7 @@
           kubernetes.core.k8s_info:
             api_version: argoproj.io/v1alpha1
             kind: Application
-            namespace: argocd
+            namespace: "{{ argocd_namespace }}"
           register: argo_apps_status
           until: >-
             (argo_apps_status.resources

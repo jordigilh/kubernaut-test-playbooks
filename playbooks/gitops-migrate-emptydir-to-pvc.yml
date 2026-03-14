@@ -71,28 +71,28 @@
       ansible.builtin.debug:
         msg: "Using image from Deployment: {{ pg_image }}"
 
-    - name: Extract DB credentials from Deployment env Secret references
+    - name: Build env var lookup from container spec
+      ansible.builtin.set_fact:
+        _container_env: "{{ deployment_info.resources[0].spec.template.spec.containers[0].env | default([]) }}"
+
+    - name: Extract DB credentials from Deployment env (upstream and RHEL conventions)
       ansible.builtin.set_fact:
         db_password_secret_name: >-
-          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
-             | selectattr('name', 'equalto', 'POSTGRES_PASSWORD')
-             | map(attribute='valueFrom.secretKeyRef.name')
-             | first | default('') }}
+          {{ (_container_env | selectattr('name', 'in', ['POSTGRES_PASSWORD', 'POSTGRESQL_PASSWORD'])
+              | map(attribute='valueFrom.secretKeyRef.name')
+              | first) | default('') }}
         db_password_secret_key: >-
-          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
-             | selectattr('name', 'equalto', 'POSTGRES_PASSWORD')
-             | map(attribute='valueFrom.secretKeyRef.key')
-             | first | default('password') }}
+          {{ (_container_env | selectattr('name', 'in', ['POSTGRES_PASSWORD', 'POSTGRESQL_PASSWORD'])
+              | map(attribute='valueFrom.secretKeyRef.key')
+              | first) | default('password') }}
         db_user: >-
-          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
-             | selectattr('name', 'equalto', 'POSTGRES_USER')
-             | map(attribute='value')
-             | first | default('postgres') }}
+          {{ (_container_env | selectattr('name', 'in', ['POSTGRES_USER', 'POSTGRESQL_USER'])
+              | map(attribute='value')
+              | first) | default('postgres') }}
         db_name: >-
-          {{ deployment_info.resources[0].spec.template.spec.containers[0].env
-             | selectattr('name', 'equalto', 'POSTGRES_DB')
-             | map(attribute='value')
-             | first | default('postgres') }}
+          {{ (_container_env | selectattr('name', 'in', ['POSTGRES_DB', 'POSTGRESQL_DATABASE'])
+              | map(attribute='value')
+              | first) | default('postgres') }}
 
     - name: Read DB password from Secret
       kubernetes.core.k8s_info:

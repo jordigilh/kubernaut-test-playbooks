@@ -216,6 +216,47 @@
       ansible.builtin.debug:
         msg: "Phase 1 complete: node {{ NODE_NAME }} cordoned"
 
+    # ── Temporarily tolerate DiskPressure so the DB pod can restart ─────
+    # The kubelet taints the node with node.kubernetes.io/disk-pressure
+    # which prevents all pods from scheduling. We need the DB running
+    # long enough for pg_dump, so patch the Deployment with a toleration.
+
+    - name: "Phase 1b: Patch deployment to tolerate DiskPressure taint"
+      kubernetes.core.k8s:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ TARGET_DEPLOYMENT }}"
+        namespace: "{{ TARGET_NAMESPACE }}"
+        definition:
+          spec:
+            template:
+              spec:
+                tolerations:
+                  - key: "node.kubernetes.io/disk-pressure"
+                    operator: "Exists"
+                    effect: "NoSchedule"
+        merge_type: strategic-merge
+
+    - name: Wait for tolerated pod to become Ready
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ TARGET_NAMESPACE }}"
+        label_selectors:
+          - "app={{ TARGET_DEPLOYMENT }}"
+        field_selectors:
+          - "status.phase=Running"
+      register: tolerated_pods
+      until: >-
+        tolerated_pods.resources | length > 0
+        and (tolerated_pods.resources[0].status.containerStatuses | default([])
+             | selectattr('ready', 'equalto', true) | list | length > 0)
+      retries: 60
+      delay: 5
+
+    - name: Log Phase 1b complete
+      ansible.builtin.debug:
+        msg: "Phase 1b complete: {{ TARGET_DEPLOYMENT }} pod restarted with DiskPressure toleration"
+
     # ══════════════════════════════════════════════════════════════════════
     # Phase 2: Backup -- pg_dump to a temporary PVC on a healthy node
     # ══════════════════════════════════════════════════════════════════════

@@ -16,11 +16,12 @@
 #
 # The playbook:
 #   1. Cordons the affected node to prevent scheduling
-#   2. Discovers DB credentials from the Deployment's Secret references
-#   3. Backs up the database via pg_dump to a temporary PVC on a healthy node
-#   4. Commits the emptyDir->PVC migration to the GitOps repo (ArgoCD syncs)
-#   5. Restores the database from the backup
-#   6. Uncordons the node and verifies DiskPressure resolves
+#   2. Best-effort backup: if the postgres pod is still running (service has
+#      endpoints), runs pg_dump to a temporary PVC. If the pod was already
+#      evicted, skips backup and accepts data loss.
+#   3. Commits the emptyDir->PVC migration to the GitOps repo (ArgoCD syncs)
+#   4. Restores the database from backup (only if backup succeeded)
+#   5. Uncordons the node, verifies DiskPressure resolves, cleans up temp resources
 #
 # Each phase uses block/rescue for safe rollback on failure.
 
@@ -216,206 +217,207 @@
       ansible.builtin.debug:
         msg: "Phase 1 complete: node {{ NODE_NAME }} cordoned"
 
-    # ── Temporarily tolerate DiskPressure so postgres can restart ────────
-    # The kubelet taints the node with node.kubernetes.io/disk-pressure:NoSchedule,
-    # which prevents evicted pods from rescheduling. We add a toleration so the
-    # DB pod can start long enough for pg_dump to capture its data.
-    # ArgoCD will overwrite this patch when it syncs the GitOps commit in Phase 3.
-
-    - name: Patch deployment to tolerate DiskPressure taint
-      kubernetes.core.k8s:
-        api_version: apps/v1
-        kind: Deployment
-        name: "{{ TARGET_DEPLOYMENT }}"
-        namespace: "{{ TARGET_NAMESPACE }}"
-        merge_type: strategic-merge
-        definition:
-          spec:
-            template:
-              spec:
-                tolerations:
-                  - key: "node.kubernetes.io/disk-pressure"
-                    operator: "Exists"
-                    effect: "NoSchedule"
-                  - key: "node.kubernetes.io/unschedulable"
-                    operator: "Exists"
-                    effect: "NoSchedule"
-
-    - name: Wait for postgres pod to become Ready after toleration patch
-      kubernetes.core.k8s_info:
-        kind: Pod
-        namespace: "{{ TARGET_NAMESPACE }}"
-        label_selectors:
-          - "app={{ TARGET_DEPLOYMENT }}"
-        field_selectors:
-          - "status.phase=Running"
-      register: pg_pods
-      until: >-
-        pg_pods.resources | length > 0
-        and (pg_pods.resources[0].status.containerStatuses | default([])
-             | selectattr('ready', 'equalto', true) | list | length > 0)
-      retries: 60
-      delay: 5
-
-    - name: Log postgres is back
-      ansible.builtin.debug:
-        msg: "Postgres pod is Running and Ready with DiskPressure toleration"
-
     # ══════════════════════════════════════════════════════════════════════
     # Phase 2: Backup -- pg_dump to a temporary PVC on a healthy node
     # ══════════════════════════════════════════════════════════════════════
 
-    - name: "Phase 2: Backup database"
+    - name: "Phase 2: Best-effort backup"
       block:
-        - name: Create backup PVC
-          kubernetes.core.k8s:
-            state: present
-            definition:
-              apiVersion: v1
-              kind: PersistentVolumeClaim
-              metadata:
-                name: "{{ backup_pvc_name }}"
-                namespace: "{{ TARGET_NAMESPACE }}"
-              spec:
-                accessModes: ["ReadWriteOnce"]
-                storageClassName: "{{ storage_class }}"
-                resources:
-                  requests:
-                    storage: "{{ pvc_size }}"
+        - name: Check if postgres service has endpoints
+          kubernetes.core.k8s_info:
+            kind: Endpoints
+            name: "{{ TARGET_DEPLOYMENT }}"
+            namespace: "{{ TARGET_NAMESPACE }}"
+          register: pg_endpoints
 
-        - name: Build PGPASSWORD env section
+        - name: Evaluate backup feasibility
           ansible.builtin.set_fact:
-            pgpassword_env: >-
-              {{ [{'name': 'PGPASSWORD', 'value': db_password}] if db_password | length > 0 else [] }}
-          no_log: true
+            backup_feasible: >-
+              {{ pg_endpoints.resources | length > 0
+                 and (pg_endpoints.resources[0].subsets | default([]) | length > 0) }}
 
-        - name: Run pg_dump Job
-          kubernetes.core.k8s:
-            state: present
-            definition:
-              apiVersion: batch/v1
-              kind: Job
-              metadata:
+        - name: Log backup feasibility
+          ansible.builtin.debug:
+            msg: >-
+              Backup feasible: {{ backup_feasible }}.
+              {{ 'Pod is still running -- attempting pg_dump.'
+                 if backup_feasible | bool else
+                 'Pod has been evicted (no service endpoints). Skipping backup -- data loss accepted.' }}
+
+        - name: Skip backup when pod is evicted
+          ansible.builtin.set_fact:
+            backup_available: false
+          when: not (backup_feasible | bool)
+
+        - name: Attempt backup when pod is alive
+          when: backup_feasible | bool
+          block:
+            - name: Build PGPASSWORD env section
+              ansible.builtin.set_fact:
+                pgpassword_env: >-
+                  {{ [{'name': 'PGPASSWORD', 'value': db_password}] if db_password | length > 0 else [] }}
+              no_log: true
+
+            - name: Create backup PVC
+              kubernetes.core.k8s:
+                state: present
+                definition:
+                  apiVersion: v1
+                  kind: PersistentVolumeClaim
+                  metadata:
+                    name: "{{ backup_pvc_name }}"
+                    namespace: "{{ TARGET_NAMESPACE }}"
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: "{{ storage_class }}"
+                    resources:
+                      requests:
+                        storage: "{{ pvc_size }}"
+
+            - name: Run pg_dump Job
+              kubernetes.core.k8s:
+                state: present
+                definition:
+                  apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: postgres-backup
+                    namespace: "{{ TARGET_NAMESPACE }}"
+                  spec:
+                    activeDeadlineSeconds: 180
+                    backoffLimit: 0
+                    template:
+                      spec:
+                        affinity:
+                          nodeAffinity:
+                            requiredDuringSchedulingIgnoredDuringExecution:
+                              nodeSelectorTerms:
+                                - matchExpressions:
+                                    - key: kubernetes.io/hostname
+                                      operator: NotIn
+                                      values: ["{{ NODE_NAME }}"]
+                        containers:
+                          - name: backup
+                            image: "{{ pg_image }}"
+                            command: ["sh", "-c"]
+                            args:
+                              - |
+                                set -e
+                                DEADLINE=$((SECONDS + 120))
+                                echo "Waiting for PostgreSQL to accept connections (max 2 min)..."
+                                until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
+                                  if [ $SECONDS -ge $DEADLINE ]; then
+                                    echo "ERROR: PostgreSQL did not become ready within 2 minutes"
+                                    exit 1
+                                  fi
+                                  echo "  not ready, retrying in 5s..."
+                                  sleep 5
+                                done
+                                echo "PostgreSQL is ready. Starting pg_dump..."
+                                pg_dump -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                                  -U {{ db_user }} -Fc {{ db_name }} > /backup/dump.pgdump
+                                size=$(du -sh /backup/dump.pgdump | cut -f1)
+                                echo "Backup complete. Size: ${size}"
+                                if [ ! -s /backup/dump.pgdump ]; then
+                                  echo "ERROR: dump file is empty"
+                                  exit 1
+                                fi
+                            env: "{{ pgpassword_env }}"
+                            volumeMounts:
+                              - name: backup-vol
+                                mountPath: /backup
+                        volumes:
+                          - name: backup-vol
+                            persistentVolumeClaim:
+                              claimName: "{{ backup_pvc_name }}"
+                        restartPolicy: Never
+
+            - name: Wait for backup Job to complete
+              kubernetes.core.k8s_info:
+                kind: Job
                 name: postgres-backup
                 namespace: "{{ TARGET_NAMESPACE }}"
-              spec:
-                backoffLimit: 0
-                template:
+              register: backup_job
+              until: >-
+                (backup_job.resources[0].status.succeeded | default(0)) == 1
+                or (backup_job.resources[0].status.failed | default(0)) > 0
+              retries: 40
+              delay: 10
+
+            - name: Fail if backup Job did not succeed
+              ansible.builtin.fail:
+                msg: "pg_dump Job failed"
+              when: (backup_job.resources[0].status.succeeded | default(0)) != 1
+
+            - name: Verify backup integrity
+              kubernetes.core.k8s:
+                state: present
+                definition:
+                  apiVersion: batch/v1
+                  kind: Job
+                  metadata:
+                    name: postgres-backup-verify
+                    namespace: "{{ TARGET_NAMESPACE }}"
                   spec:
-                    affinity:
-                      nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                          nodeSelectorTerms:
-                            - matchExpressions:
-                                - key: kubernetes.io/hostname
-                                  operator: NotIn
-                                  values: ["{{ NODE_NAME }}"]
-                    containers:
-                      - name: backup
-                        image: "{{ pg_image }}"
-                        command: ["sh", "-c"]
-                        args:
-                          - |
-                            set -e
-                            echo "Waiting for PostgreSQL to accept connections..."
-                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
-                              echo "  not ready, retrying in 5s..."
-                              sleep 5
-                            done
-                            echo "PostgreSQL is ready. Starting pg_dump..."
-                            pg_dump -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
-                              -U {{ db_user }} -Fc {{ db_name }} > /backup/dump.pgdump
-                            size=$(du -sh /backup/dump.pgdump | cut -f1)
-                            echo "Backup complete. Size: ${size}"
-                            if [ ! -s /backup/dump.pgdump ]; then
-                              echo "ERROR: dump file is empty"
-                              exit 1
-                            fi
-                        env: "{{ pgpassword_env }}"
-                        volumeMounts:
+                    activeDeadlineSeconds: 60
+                    backoffLimit: 0
+                    template:
+                      spec:
+                        containers:
+                          - name: verify
+                            image: "{{ pg_image }}"
+                            command: ["pg_restore", "--list", "/backup/dump.pgdump"]
+                            volumeMounts:
+                              - name: backup-vol
+                                mountPath: /backup
+                        volumes:
                           - name: backup-vol
-                            mountPath: /backup
-                    volumes:
-                      - name: backup-vol
-                        persistentVolumeClaim:
-                          claimName: "{{ backup_pvc_name }}"
-                    restartPolicy: Never
+                            persistentVolumeClaim:
+                              claimName: "{{ backup_pvc_name }}"
+                        restartPolicy: Never
 
-        - name: Wait for backup Job to complete
-          kubernetes.core.k8s_info:
-            kind: Job
-            name: postgres-backup
-            namespace: "{{ TARGET_NAMESPACE }}"
-          register: backup_job
-          until: >-
-            (backup_job.resources[0].status.succeeded | default(0)) == 1
-            or (backup_job.resources[0].status.failed | default(0)) > 0
-          retries: 60
-          delay: 10
-
-        - name: Fail if backup Job did not succeed
-          ansible.builtin.fail:
-            msg: "pg_dump Job failed"
-          when: (backup_job.resources[0].status.succeeded | default(0)) != 1
-
-        - name: Verify backup integrity
-          kubernetes.core.k8s:
-            state: present
-            definition:
-              apiVersion: batch/v1
-              kind: Job
-              metadata:
+            - name: Wait for verification Job
+              kubernetes.core.k8s_info:
+                kind: Job
                 name: postgres-backup-verify
                 namespace: "{{ TARGET_NAMESPACE }}"
-              spec:
-                backoffLimit: 0
-                template:
-                  spec:
-                    containers:
-                      - name: verify
-                        image: "{{ pg_image }}"
-                        command: ["pg_restore", "--list", "/backup/dump.pgdump"]
-                        volumeMounts:
-                          - name: backup-vol
-                            mountPath: /backup
-                    volumes:
-                      - name: backup-vol
-                        persistentVolumeClaim:
-                          claimName: "{{ backup_pvc_name }}"
-                    restartPolicy: Never
+              register: verify_job
+              until: >-
+                (verify_job.resources[0].status.succeeded | default(0)) == 1
+                or (verify_job.resources[0].status.failed | default(0)) > 0
+              retries: 20
+              delay: 5
 
-        - name: Wait for verification Job
-          kubernetes.core.k8s_info:
-            kind: Job
-            name: postgres-backup-verify
-            namespace: "{{ TARGET_NAMESPACE }}"
-          register: verify_job
-          until: >-
-            (verify_job.resources[0].status.succeeded | default(0)) == 1
-            or (verify_job.resources[0].status.failed | default(0)) > 0
-          retries: 20
-          delay: 5
+            - name: Fail if verification did not succeed
+              ansible.builtin.fail:
+                msg: "Backup verification failed -- dump may be corrupt"
+              when: (verify_job.resources[0].status.succeeded | default(0)) != 1
 
-        - name: Fail if verification did not succeed
-          ansible.builtin.fail:
-            msg: "Backup verification failed -- dump may be corrupt"
-          when: (verify_job.resources[0].status.succeeded | default(0)) != 1
+            - name: Mark backup as available
+              ansible.builtin.set_fact:
+                backup_available: true
 
-        - name: Log Phase 2 complete
-          ansible.builtin.debug:
-            msg: "Phase 2 complete: database backed up and verified"
+            - name: Log Phase 2 complete with backup
+              ansible.builtin.debug:
+                msg: "Phase 2 complete: database backed up and verified"
+
+          rescue:
+            - name: Mark backup as unavailable after failure
+              ansible.builtin.set_fact:
+                backup_available: false
+            - ansible.builtin.debug:
+                msg: >-
+                  WARNING: Backup failed (pod likely evicted during dump).
+                  Data loss accepted. Proceeding with emptyDir-to-PVC migration.
 
       rescue:
-        - name: "RESCUE Phase 2: uncordon node and abort"
-          kubernetes.core.k8s_drain:
-            name: "{{ NODE_NAME }}"
-            state: uncordon
-          ignore_errors: true
-        - ansible.builtin.fail:
+        - name: "RESCUE Phase 2: mark backup unavailable on unexpected error"
+          ansible.builtin.set_fact:
+            backup_available: false
+        - ansible.builtin.debug:
             msg: >-
-              Backup failed. Node {{ NODE_NAME }} uncordoned.
-              Original pod and emptyDir data are intact.
-              Manual intervention required.
+              WARNING: Phase 2 encountered an unexpected error.
+              Proceeding without backup. Data loss accepted.
 
     # ══════════════════════════════════════════════════════════════════════
     # Phase 3: GitOps migration -- commit emptyDir->PVC to Git
@@ -593,7 +595,15 @@
     # Phase 4: Restore -- pg_restore to the new PVC-backed instance
     # ══════════════════════════════════════════════════════════════════════
 
-    - name: "Phase 4: Restore database"
+    - name: "Phase 4: Skip restore (no backup available)"
+      ansible.builtin.debug:
+        msg: >-
+          Phase 4 skipped: no backup was captured (pod was evicted before pg_dump).
+          The new PVC-backed instance starts fresh.
+      when: not (backup_available | default(false) | bool)
+
+    - name: "Phase 4: Restore database from backup"
+      when: backup_available | default(false) | bool
       block:
         - name: Run pg_restore Job
           kubernetes.core.k8s:
@@ -605,6 +615,7 @@
                 name: postgres-restore
                 namespace: "{{ TARGET_NAMESPACE }}"
               spec:
+                activeDeadlineSeconds: 300
                 backoffLimit: 0
                 template:
                   spec:
@@ -688,7 +699,7 @@
           retries: 60
           delay: 10
 
-        - name: Delete temporary backup resources
+        - name: Delete temporary backup resources (always attempt, may not all exist)
           kubernetes.core.k8s:
             state: absent
             kind: "{{ item.kind }}"
@@ -708,4 +719,5 @@
               Deployment: {{ TARGET_DEPLOYMENT }} in {{ TARGET_NAMESPACE }}
               Storage: PVC {{ permanent_pvc_name }} ({{ pvc_size }})
               Node: {{ NODE_NAME }} uncordoned, DiskPressure resolved
+              Backup restored: {{ backup_available | default(false) | bool }}
               Git commit: remediation for {{ rr_name }}

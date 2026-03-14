@@ -175,10 +175,18 @@
 
     - name: Resolve default StorageClass
       ansible.builtin.set_fact:
-        storage_class: >-
-          {{ storage_classes.resources
-             | json_query("[?metadata.annotations.\"storageclass.kubernetes.io/is-default-class\"=='true'].metadata.name | [0]")
-             | default(storage_classes.resources[0].metadata.name, true) }}
+        storage_class: "{{ item.metadata.name }}"
+      loop: "{{ storage_classes.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when:
+        - item.metadata.annotations is defined
+        - item.metadata.annotations['storageclass.kubernetes.io/is-default-class'] | default('false') == 'true'
+
+    - name: Fallback to first StorageClass if no default annotated
+      ansible.builtin.set_fact:
+        storage_class: "{{ storage_classes.resources[0].metadata.name }}"
+      when: storage_class is not defined
 
     - name: Log discovered info
       ansible.builtin.debug:

@@ -389,7 +389,6 @@
             dest: "{{ work_dir.path }}/repo"
             version: "{{ git_branch }}"
             force: true
-          no_log: true
 
         - name: Configure git identity
           ansible.builtin.shell: |

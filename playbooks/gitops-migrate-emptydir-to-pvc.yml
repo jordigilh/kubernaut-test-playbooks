@@ -540,6 +540,11 @@
             path: "{{ work_dir.path }}"
             state: absent
 
+        - name: Uncordon node before ArgoCD rollout
+          kubernetes.core.k8s_drain:
+            name: "{{ NODE_NAME }}"
+            state: uncordon
+
         - name: Wait for ArgoCD sync and healthy rollout
           kubernetes.core.k8s_info:
             api_version: argoproj.io/v1alpha1

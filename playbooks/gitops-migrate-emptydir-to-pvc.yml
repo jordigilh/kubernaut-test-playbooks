@@ -237,6 +237,9 @@
                   - key: "node.kubernetes.io/disk-pressure"
                     operator: "Exists"
                     effect: "NoSchedule"
+                  - key: "node.kubernetes.io/unschedulable"
+                    operator: "Exists"
+                    effect: "NoSchedule"
 
     - name: Wait for postgres pod to become Ready after toleration patch
       kubernetes.core.k8s_info:

@@ -176,12 +176,9 @@
     - name: Resolve default StorageClass
       ansible.builtin.set_fact:
         storage_class: >-
-          {{ (storage_classes.resources
-              | selectattr('metadata.annotations', 'defined')
-              | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'defined')
-              | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'equalto', 'true')
-              | map(attribute='metadata.name')
-              | first) | default(storage_classes.resources[0].metadata.name) }}
+          {{ storage_classes.resources
+             | json_query("[?metadata.annotations.\"storageclass.kubernetes.io/is-default-class\"=='true'].metadata.name | [0]")
+             | default(storage_classes.resources[0].metadata.name, true) }}
 
     - name: Log discovered info
       ansible.builtin.debug:

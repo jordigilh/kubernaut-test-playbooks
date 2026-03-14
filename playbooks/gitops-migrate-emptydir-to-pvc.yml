@@ -479,7 +479,7 @@
             regexp: 'emptyDir:\s*\{\}'
             replace: |-
               persistentVolumeClaim:
-                    claimName: {{ permanent_pvc_name }}
+                        claimName: {{ permanent_pvc_name }}
           loop: "{{ deployment_files.files }}"
           vars:
             deployment_files: "{{ lookup('pipe', 'find ' + repo_manifest_path + ' -name \"*.yaml\" -exec grep -l \"kind: Deployment\" {} +') }}"
@@ -499,7 +499,7 @@
             regexp: 'emptyDir:\s*\{\}'
             replace: |-
               persistentVolumeClaim:
-                    claimName: {{ permanent_pvc_name }}
+                        claimName: {{ permanent_pvc_name }}
           loop: "{{ deployment_yaml_files.files }}"
           when: deployment_yaml_files.matched > 0
 
@@ -606,9 +606,13 @@
                         command: ["sh", "-c"]
                         args:
                           - |
-                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }}; do
-                              sleep 2
+                            set -e
+                            echo "Waiting for PostgreSQL to accept connections..."
+                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
+                              echo "  not ready, retrying in 5s..."
+                              sleep 5
                             done
+                            echo "PostgreSQL is ready. Starting pg_restore..."
                             pg_restore -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
                               -U {{ db_user }} -d {{ db_name }} --clean --if-exists /backup/dump.pgdump
                             echo "Restore complete. Row count:"

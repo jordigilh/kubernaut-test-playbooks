@@ -271,9 +271,21 @@
                         command: ["sh", "-c"]
                         args:
                           - |
+                            set -e
+                            echo "Waiting for PostgreSQL to accept connections..."
+                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
+                              echo "  not ready, retrying in 5s..."
+                              sleep 5
+                            done
+                            echo "PostgreSQL is ready. Starting pg_dump..."
                             pg_dump -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
                               -U {{ db_user }} -Fc {{ db_name }} > /backup/dump.pgdump
-                            echo "Backup complete. Size: $(du -sh /backup/dump.pgdump | cut -f1)"
+                            size=$(du -sh /backup/dump.pgdump | cut -f1)
+                            echo "Backup complete. Size: ${size}"
+                            if [ ! -s /backup/dump.pgdump ]; then
+                              echo "ERROR: dump file is empty"
+                              exit 1
+                            fi
                         env: "{{ pgpassword_env }}"
                         volumeMounts:
                           - name: backup-vol

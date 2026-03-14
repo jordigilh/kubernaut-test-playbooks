@@ -7,10 +7,8 @@
 #   TARGET_DEPLOYMENT  - Name of the deployment using emptyDir
 #   NODE_NAME          - Name of the node reporting DiskPressure
 #   PVC_SIZE           - Size for the new PVC (default: "2Gi")
-#   STORAGE_CLASS      - StorageClass for the new PVC (default: cluster default)
 #   WFE_NAME           - WorkflowExecution name (for RR lookup)
 #   WFE_NAMESPACE      - WorkflowExecution namespace
-#   ARGOCD_NAMESPACE   - Namespace where ArgoCD Applications live (default: "argocd", OCP: "openshift-gitops")
 #
 # Required AWX credential env vars (injected via dependencies.secrets):
 #   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
@@ -33,8 +31,6 @@
 
   vars:
     pvc_size: "{{ PVC_SIZE | default('2Gi') }}"
-    storage_class: "{{ STORAGE_CLASS | default('') }}"
-    argocd_namespace: "{{ ARGOCD_NAMESPACE | default('argocd') }}"
     backup_pvc_name: "postgres-emergency-backup"
     permanent_pvc_name: "postgres-data"
 
@@ -148,7 +144,6 @@
       kubernetes.core.k8s_info:
         api_version: argoproj.io/v1alpha1
         kind: Application
-        namespace: "{{ argocd_namespace }}"
       register: argocd_apps
 
     - name: Extract repo URL and branch from ArgoCD Application
@@ -170,10 +165,29 @@
       ansible.builtin.set_fact:
         git_branch: "{{ 'main' if (git_branch_raw == 'HEAD' or git_branch_raw == '') else git_branch_raw }}"
 
+    # ── Discover default StorageClass ──────────────────────────────────────
+
+    - name: Get StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: storage_classes
+
+    - name: Resolve default StorageClass
+      ansible.builtin.set_fact:
+        storage_class: >-
+          {{ (storage_classes.resources
+              | selectattr('metadata.annotations', 'defined')
+              | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'defined')
+              | selectattr('metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class', 'equalto', 'true')
+              | map(attribute='metadata.name')
+              | first) | default(storage_classes.resources[0].metadata.name) }}
+
     - name: Log discovered info
       ansible.builtin.debug:
         msg: >-
           DB: {{ db_user }}@{{ db_name }} | Image: {{ pg_image }} |
+          StorageClass: {{ storage_class }} |
           ArgoCD: repo={{ git_repo_url }} branch={{ git_branch }} path={{ git_repo_path }} |
           RR: {{ rr_name }}
 
@@ -203,10 +217,6 @@
 
     - name: "Phase 2: Backup database"
       block:
-        - name: Determine StorageClass for PVCs
-          ansible.builtin.set_fact:
-            target_storage_class: "{{ storage_class if storage_class | length > 0 else omit }}"
-
         - name: Create backup PVC
           kubernetes.core.k8s:
             state: present
@@ -218,7 +228,7 @@
                 namespace: "{{ TARGET_NAMESPACE }}"
               spec:
                 accessModes: ["ReadWriteOnce"]
-                storageClassName: "{{ target_storage_class | default(omit) }}"
+                storageClassName: "{{ storage_class }}"
                 resources:
                   requests:
                     storage: "{{ pvc_size }}"
@@ -399,7 +409,7 @@
               spec:
                 accessModes:
                   - ReadWriteOnce
-                {{ 'storageClassName: ' + storage_class if storage_class | length > 0 else '' }}
+                storageClassName: {{ storage_class }}
                 resources:
                   requests:
                     storage: {{ pvc_size }}
@@ -472,7 +482,6 @@
           kubernetes.core.k8s_info:
             api_version: argoproj.io/v1alpha1
             kind: Application
-            namespace: "{{ argocd_namespace }}"
           register: argo_apps_status
           until: >-
             (argo_apps_status.resources

@@ -548,7 +548,12 @@
             path: "{{ work_dir.path }}"
             state: absent
 
-        - name: Find ArgoCD Application name for target namespace
+        - name: Uncordon node before ArgoCD rollout
+          kubernetes.core.k8s_drain:
+            name: "{{ NODE_NAME }}"
+            state: uncordon
+
+        - name: Find ArgoCD Application for target namespace
           ansible.builtin.set_fact:
             argocd_app_name: >-
               {{ (argocd_apps.resources
@@ -559,23 +564,7 @@
                   | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
                   | first).metadata.namespace }}
 
-        - name: Force ArgoCD to detect new commit and sync
-          kubernetes.core.k8s_json_patch:
-            api_version: argoproj.io/v1alpha1
-            kind: Application
-            name: "{{ argocd_app_name }}"
-            namespace: "{{ argocd_app_namespace }}"
-            patch:
-              - op: add
-                path: /metadata/annotations/argocd.argoproj.io~1refresh
-                value: "hard"
-
-        - name: Uncordon node before ArgoCD rollout
-          kubernetes.core.k8s_drain:
-            name: "{{ NODE_NAME }}"
-            state: uncordon
-
-        - name: Wait for ArgoCD to sync the pushed revision
+        - name: Wait for ArgoCD to sync the pushed revision (via Gitea webhook)
           kubernetes.core.k8s_info:
             api_version: argoproj.io/v1alpha1
             kind: Application
@@ -588,7 +577,7 @@
             and
             (argo_app_status.resources[0].status.sync.status | default('')) == 'Synced'
           retries: 60
-          delay: 10
+          delay: 5
 
         - name: Verify new pod is running with PVC
           kubernetes.core.k8s_info:

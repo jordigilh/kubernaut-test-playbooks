@@ -31,7 +31,7 @@
   gather_facts: false
 
   vars:
-    pvc_size: "{{ PVC_SIZE | default('2Gi') }}"
+    pvc_size: "{{ PVC_SIZE | default('10Gi') }}"
     backup_pvc_name: "postgres-emergency-backup"
     permanent_pvc_name: "postgres-data"
 

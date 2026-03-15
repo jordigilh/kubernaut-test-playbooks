@@ -631,8 +631,8 @@
                 name: postgres-restore
                 namespace: "{{ TARGET_NAMESPACE }}"
               spec:
-                activeDeadlineSeconds: 300
-                backoffLimit: 0
+                activeDeadlineSeconds: 600
+                backoffLimit: 3
                 template:
                   spec:
                     containers:
@@ -647,7 +647,17 @@
                               echo "  not ready, retrying in 5s..."
                               sleep 5
                             done
-                            echo "PostgreSQL is ready. Starting pg_restore..."
+                            echo "PostgreSQL is accepting connections. Verifying stability..."
+                            for i in 1 2 3; do
+                              sleep 5
+                              psql -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                                -U {{ db_user }} -d {{ db_name }} -c "SELECT 1;" >/dev/null 2>&1 || {
+                                echo "  stability check $i failed, retrying..."
+                                continue
+                              }
+                              echo "  stability check $i passed"
+                            done
+                            echo "PostgreSQL is stable. Starting pg_restore..."
                             pg_restore -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
                               -U {{ db_user }} -d {{ db_name }} --clean --if-exists /backup/dump.pgdump
                             echo "Restore complete. Row count:"

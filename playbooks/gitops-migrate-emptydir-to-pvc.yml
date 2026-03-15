@@ -537,29 +537,60 @@
           ansible.builtin.debug:
             msg: "{{ git_push_result.stdout_lines | default(['Push complete']) }}"
 
+        - name: Capture pushed commit SHA
+          ansible.builtin.shell: git rev-parse HEAD
+          args:
+            chdir: "{{ work_dir.path }}/repo"
+          register: pushed_sha
+
         - name: Cleanup work directory
           ansible.builtin.file:
             path: "{{ work_dir.path }}"
             state: absent
+
+        - name: Find ArgoCD Application name for target namespace
+          ansible.builtin.set_fact:
+            argocd_app_name: >-
+              {{ (argocd_apps.resources
+                  | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+                  | first).metadata.name }}
+            argocd_app_namespace: >-
+              {{ (argocd_apps.resources
+                  | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+                  | first).metadata.namespace }}
+
+        - name: Force ArgoCD to detect new commit (refresh annotation)
+          kubernetes.core.k8s:
+            state: patched
+            api_version: argoproj.io/v1alpha1
+            kind: Application
+            name: "{{ argocd_app_name }}"
+            namespace: "{{ argocd_app_namespace }}"
+            definition:
+              metadata:
+                annotations:
+                  argocd.argoproj.io/refresh: "hard"
 
         - name: Uncordon node before ArgoCD rollout
           kubernetes.core.k8s_drain:
             name: "{{ NODE_NAME }}"
             state: uncordon
 
-        - name: Wait for ArgoCD sync and healthy rollout
+        - name: Wait for ArgoCD to sync the pushed revision
           kubernetes.core.k8s_info:
             api_version: argoproj.io/v1alpha1
             kind: Application
-          register: argo_apps_status
+            name: "{{ argocd_app_name }}"
+            namespace: "{{ argocd_app_namespace }}"
+          register: argo_app_status
           until: >-
-            (argo_apps_status.resources
-             | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
-             | map(attribute='status.sync.status') | first | default('')) == 'Synced'
+            (argo_app_status.resources[0].status.sync.revision | default(''))
+            == pushed_sha.stdout
             and
-            (argo_apps_status.resources
-             | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
-             | map(attribute='status.health.status') | first | default('')) == 'Healthy'
+            (argo_app_status.resources[0].status.sync.status | default('')) == 'Synced'
+            and
+            (argo_app_status.resources[0].status.health.status | default(''))
+            in ['Healthy', 'Progressing']
           retries: 60
           delay: 10
 

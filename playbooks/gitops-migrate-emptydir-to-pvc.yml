@@ -559,28 +559,16 @@
                   | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
                   | first).metadata.namespace }}
 
-        - name: Force ArgoCD to detect new commit (refresh annotation)
-          ansible.builtin.command: >
-            kubectl annotate application {{ argocd_app_name }}
-            -n {{ argocd_app_namespace }}
-            argocd.argoproj.io/refresh=hard
-            --overwrite
-
-        - name: Trigger ArgoCD sync to pushed revision
-          kubernetes.core.k8s:
-            state: present
+        - name: Force ArgoCD to detect new commit and sync
+          kubernetes.core.k8s_json_patch:
             api_version: argoproj.io/v1alpha1
             kind: Application
             name: "{{ argocd_app_name }}"
             namespace: "{{ argocd_app_namespace }}"
-            definition:
-              operation:
-                sync:
-                  revision: "{{ pushed_sha.stdout }}"
-                  prune: true
-                  syncStrategy:
-                    apply:
-                      force: true
+            patch:
+              - op: add
+                path: /metadata/annotations/argocd.argoproj.io~1refresh
+                value: "hard"
 
         - name: Uncordon node before ArgoCD rollout
           kubernetes.core.k8s_drain:

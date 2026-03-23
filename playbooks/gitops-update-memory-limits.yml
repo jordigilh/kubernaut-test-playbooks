@@ -183,7 +183,7 @@
           exit 0
         fi
         git commit -m "remediation({{ rr_name }}): increase memory limits to {{ NEW_MEMORY_LIMIT }}"
-        git push origin {{ git_branch }}
+        git push "{{ auth_repo_url }}" {{ git_branch }}
       args:
         chdir: "{{ work_dir.path }}/repo"
       register: git_push_result

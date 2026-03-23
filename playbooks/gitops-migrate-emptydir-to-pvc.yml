@@ -528,7 +528,7 @@
             Root cause: emptyDir growth on {{ TARGET_DEPLOYMENT }} caused
             KubeNodeDiskPressure on node {{ NODE_NAME }}.
             Action: replaced emptyDir volume with PVC ({{ pvc_size }})."
-            git push origin {{ git_branch }}
+            git push "{{ auth_repo_url }}" {{ git_branch }}
           args:
             chdir: "{{ work_dir.path }}/repo"
           register: git_push_result

@@ -1,5 +1,5 @@
 ---
-# Kubernaut Ansible Playbook: Migrate emptyDir Database to PVC via GitOps
+# Kubernaut Ansible Playbook: Migrate PostgreSQL emptyDir to PVC via GitOps
 # Issue #324: DiskPressure from emptyDir growth -> backup, GitOps migration, restore
 #
 # Required extra_vars (injected by WFE controller):
@@ -29,7 +29,7 @@
 #
 # Each phase uses block/rescue for safe rollback on failure.
 
-- name: "Migrate emptyDir Database to Persistent Storage (GitOps)"
+- name: "Migrate PostgreSQL emptyDir to Persistent Storage (GitOps)"
   hosts: localhost
   connection: local
   gather_facts: false

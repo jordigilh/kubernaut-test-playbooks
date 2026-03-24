@@ -18,7 +18,7 @@ Ansible playbooks used by Kubernaut to validate the Ansible execution engine (BR
 | Playbook | Purpose |
 |----------|---------|
 | `playbooks/gitops-update-memory-limits.yml` | Commits updated memory limits to a GitOps repo via ArgoCD |
-| `playbooks/gitops-migrate-emptydir-to-pvc.yml` | Migrates emptyDir volumes to PVC with backup/restore via GitOps |
+| `playbooks/gitops-migrate-postgres-emptydir-to-pvc.yml` | Migrates PostgreSQL emptyDir volumes to PVC with backup/restore via GitOps |
 
 ## Usage
 

@@ -19,13 +19,14 @@
 #   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password (injected via dependencies.secrets)
 #
 # The playbook:
-#   1. Cordons the affected node to prevent scheduling
-#   2. Best-effort backup: if the postgres pod is still running (service has
+#   1. Validates the target is a PostgreSQL deployment with an emptyDir volume
+#   2. Cordons the affected node to prevent scheduling
+#   3. Best-effort backup: if the postgres pod is still running (service has
 #      endpoints), runs pg_dump to a temporary PVC. If the pod was already
 #      evicted, skips backup and accepts data loss.
-#   3. Commits the emptyDir->PVC migration to the GitOps repo (ArgoCD syncs)
-#   4. Restores the database from backup (only if backup succeeded)
-#   5. Uncordons the node, verifies DiskPressure resolves, cleans up temp resources
+#   4. Commits the emptyDir->PVC migration to the GitOps repo (ArgoCD syncs)
+#   5. Restores the database from backup (only if backup succeeded)
+#   6. Uncordons the node, verifies DiskPressure resolves, cleans up temp resources
 #
 # Each phase uses block/rescue for safe rollback on failure.
 
@@ -68,9 +69,29 @@
         msg: "Deployment {{ TARGET_RESOURCE_NAME }} not found in {{ TARGET_RESOURCE_NAMESPACE }}"
       when: deployment_info.resources | length == 0
 
+    # ── Precondition checks ──────────────────────────────────────────────────
+
+    - name: Verify deployment has an emptyDir volume
+      ansible.builtin.assert:
+        that:
+          - deployment_info.resources[0].spec.template.spec.volumes | default([])
+            | selectattr('emptyDir', 'defined') | list | length > 0
+        fail_msg: >-
+          Target deployment '{{ TARGET_RESOURCE_NAME }}' does not have an emptyDir
+          volume — nothing to migrate. Aborting.
+
     - name: Extract container image for backup/restore Jobs
       ansible.builtin.set_fact:
         pg_image: "{{ deployment_info.resources[0].spec.template.spec.containers[0].image }}"
+
+    - name: Verify target runs a PostgreSQL container
+      ansible.builtin.assert:
+        that:
+          - pg_image | lower is search('postgres')
+        fail_msg: >-
+          Target deployment '{{ TARGET_RESOURCE_NAME }}' does not appear to run
+          PostgreSQL (image: {{ pg_image }}). This playbook only supports
+          PostgreSQL migrations — aborting.
 
     - name: Log discovered image
       ansible.builtin.debug:

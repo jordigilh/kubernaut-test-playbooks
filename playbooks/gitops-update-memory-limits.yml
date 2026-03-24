@@ -3,15 +3,19 @@
 # Issue #312: Increase memory limits by committing updated YAML to a GitOps repo.
 #
 # Required extra_vars (injected by WFE controller):
-#   TARGET_NAMESPACE   - Namespace of the affected deployment
-#   TARGET_DEPLOYMENT  - Name of the deployment
-#   NEW_MEMORY_LIMIT   - New memory limit value (e.g., "512Mi")
-#   WFE_NAME           - WorkflowExecution name (for RR lookup)
-#   WFE_NAMESPACE      - WorkflowExecution namespace
+#   TARGET_RESOURCE_NAMESPACE - Namespace of the affected deployment
+#   TARGET_RESOURCE_NAME      - Name of the deployment
+#   TARGET_RESOURCE_KIND      - Kind of the target resource (e.g., Deployment)
+#   NEW_MEMORY_LIMIT          - New memory limit value (e.g., "512Mi")
+#   WFE_NAME                  - WorkflowExecution name (for RR lookup)
+#   WFE_NAMESPACE             - WorkflowExecution namespace
 #
-# Required AWX credential env vars (injected via dependencies.secrets):
-#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
-#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password
+# Required AWX credential env vars:
+#   K8S_AUTH_HOST      - Kubernetes API server URL (injected via AAP K8s credential)
+#   K8S_AUTH_API_KEY   - Bearer token          (injected via AAP K8s credential)
+#   K8S_AUTH_SSL_CA_CERT - Cluster CA cert     (injected via AAP K8s credential)
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username (injected via dependencies.secrets)
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password (injected via dependencies.secrets)
 #
 # The playbook:
 #   1. Validates the new limit > current limit
@@ -33,8 +37,8 @@
     - name: Validate required parameters
       ansible.builtin.assert:
         that:
-          - TARGET_NAMESPACE is defined and TARGET_NAMESPACE | length > 0
-          - TARGET_DEPLOYMENT is defined and TARGET_DEPLOYMENT | length > 0
+          - TARGET_RESOURCE_NAMESPACE is defined and TARGET_RESOURCE_NAMESPACE | length > 0
+          - TARGET_RESOURCE_NAME is defined and TARGET_RESOURCE_NAME | length > 0
           - NEW_MEMORY_LIMIT is defined and NEW_MEMORY_LIMIT | length > 0
           - WFE_NAME is defined and WFE_NAME | length > 0
           - WFE_NAMESPACE is defined and WFE_NAMESPACE | length > 0
@@ -44,8 +48,8 @@
       kubernetes.core.k8s_info:
         api_version: apps/v1
         kind: Deployment
-        name: "{{ TARGET_DEPLOYMENT }}"
-        namespace: "{{ TARGET_NAMESPACE }}"
+        name: "{{ TARGET_RESOURCE_NAME }}"
+        namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
       register: deployment_info
 
     - name: Extract current memory limit
@@ -71,15 +75,15 @@
       ansible.builtin.set_fact:
         git_repo_url: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.repoURL }}
         git_branch_raw: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.targetRevision | default('main') }}
         git_repo_path: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.path | default('') }}
 
     - name: Normalize branch name
@@ -201,6 +205,6 @@
       ansible.builtin.debug:
         msg: >-
           Memory limits updated to {{ NEW_MEMORY_LIMIT }} for
-          {{ TARGET_DEPLOYMENT }} in {{ TARGET_NAMESPACE }}.
+          {{ TARGET_RESOURCE_NAME }} in {{ TARGET_RESOURCE_NAMESPACE }}.
           Commit references RR {{ rr_name }}.
           ArgoCD will reconcile the change.

@@ -3,16 +3,20 @@
 # Issue #324: DiskPressure from emptyDir growth -> backup, GitOps migration, restore
 #
 # Required extra_vars (injected by WFE controller):
-#   TARGET_NAMESPACE   - Namespace of the affected deployment
-#   TARGET_DEPLOYMENT  - Name of the deployment using emptyDir
-#   NODE_NAME          - Name of the node reporting DiskPressure
-#   PVC_SIZE           - Size for the new PVC (default: "2Gi")
-#   WFE_NAME           - WorkflowExecution name (for RR lookup)
-#   WFE_NAMESPACE      - WorkflowExecution namespace
+#   TARGET_RESOURCE_NAMESPACE - Namespace of the affected deployment
+#   TARGET_RESOURCE_NAME      - Name of the deployment using emptyDir
+#   TARGET_RESOURCE_KIND      - Kind of the target resource (e.g., Deployment)
+#   NODE_NAME                 - Name of the node reporting DiskPressure
+#   PVC_SIZE                  - Size for the new PVC (default: "10Gi")
+#   WFE_NAME                  - WorkflowExecution name (for RR lookup)
+#   WFE_NAMESPACE             - WorkflowExecution namespace
 #
-# Required AWX credential env vars (injected via dependencies.secrets):
-#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username
-#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password
+# Required AWX credential env vars:
+#   K8S_AUTH_HOST      - Kubernetes API server URL (injected via AAP K8s credential)
+#   K8S_AUTH_API_KEY   - Bearer token          (injected via AAP K8s credential)
+#   K8S_AUTH_SSL_CA_CERT - Cluster CA cert     (injected via AAP K8s credential)
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username (injected via dependencies.secrets)
+#   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password (injected via dependencies.secrets)
 #
 # The playbook:
 #   1. Cordons the affected node to prevent scheduling
@@ -42,8 +46,8 @@
     - name: Validate required parameters
       ansible.builtin.assert:
         that:
-          - TARGET_NAMESPACE is defined and TARGET_NAMESPACE | length > 0
-          - TARGET_DEPLOYMENT is defined and TARGET_DEPLOYMENT | length > 0
+          - TARGET_RESOURCE_NAMESPACE is defined and TARGET_RESOURCE_NAMESPACE | length > 0
+          - TARGET_RESOURCE_NAME is defined and TARGET_RESOURCE_NAME | length > 0
           - NODE_NAME is defined and NODE_NAME | length > 0
           - WFE_NAME is defined and WFE_NAME | length > 0
           - WFE_NAMESPACE is defined and WFE_NAMESPACE | length > 0
@@ -55,13 +59,13 @@
       kubernetes.core.k8s_info:
         api_version: apps/v1
         kind: Deployment
-        name: "{{ TARGET_DEPLOYMENT }}"
-        namespace: "{{ TARGET_NAMESPACE }}"
+        name: "{{ TARGET_RESOURCE_NAME }}"
+        namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
       register: deployment_info
 
     - name: Fail if deployment not found
       ansible.builtin.fail:
-        msg: "Deployment {{ TARGET_DEPLOYMENT }} not found in {{ TARGET_NAMESPACE }}"
+        msg: "Deployment {{ TARGET_RESOURCE_NAME }} not found in {{ TARGET_RESOURCE_NAMESPACE }}"
       when: deployment_info.resources | length == 0
 
     - name: Extract container image for backup/restore Jobs
@@ -100,7 +104,7 @@
         api_version: v1
         kind: Secret
         name: "{{ db_password_secret_name }}"
-        namespace: "{{ TARGET_NAMESPACE }}"
+        namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
       register: db_secret
       when: db_password_secret_name | length > 0
       no_log: true
@@ -151,15 +155,15 @@
       ansible.builtin.set_fact:
         git_repo_url: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.repoURL }}
         git_branch_raw: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.targetRevision | default('main') }}
         git_repo_path: >-
           {{ (argocd_apps.resources
-              | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+              | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
               | first).spec.source.path | default('') }}
 
     - name: Normalize branch name
@@ -226,8 +230,8 @@
         - name: Check if postgres service has endpoints
           kubernetes.core.k8s_info:
             kind: Endpoints
-            name: "{{ TARGET_DEPLOYMENT }}"
-            namespace: "{{ TARGET_NAMESPACE }}"
+            name: "{{ TARGET_RESOURCE_NAME }}"
+            namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
           register: pg_endpoints
 
         - name: Evaluate backup feasibility
@@ -266,7 +270,7 @@
                   kind: PersistentVolumeClaim
                   metadata:
                     name: "{{ backup_pvc_name }}"
-                    namespace: "{{ TARGET_NAMESPACE }}"
+                    namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
                   spec:
                     accessModes: ["ReadWriteOnce"]
                     storageClassName: "{{ storage_class }}"
@@ -282,7 +286,7 @@
                   kind: Job
                   metadata:
                     name: postgres-backup
-                    namespace: "{{ TARGET_NAMESPACE }}"
+                    namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
                   spec:
                     activeDeadlineSeconds: 180
                     backoffLimit: 0
@@ -305,7 +309,7 @@
                                 set -e
                                 DEADLINE=$((SECONDS + 120))
                                 echo "Waiting for PostgreSQL to accept connections (max 2 min)..."
-                                until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
+                                until pg_isready -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
                                   if [ $SECONDS -ge $DEADLINE ]; then
                                     echo "ERROR: PostgreSQL did not become ready within 2 minutes"
                                     exit 1
@@ -314,7 +318,7 @@
                                   sleep 5
                                 done
                                 echo "PostgreSQL is ready. Starting pg_dump..."
-                                pg_dump -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                                pg_dump -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc \
                                   -U {{ db_user }} -Fc {{ db_name }} > /backup/dump.pgdump
                                 size=$(du -sh /backup/dump.pgdump | cut -f1)
                                 echo "Backup complete. Size: ${size}"
@@ -336,7 +340,7 @@
               kubernetes.core.k8s_info:
                 kind: Job
                 name: postgres-backup
-                namespace: "{{ TARGET_NAMESPACE }}"
+                namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
               register: backup_job
               until: >-
                 (backup_job.resources[0].status.succeeded | default(0)) == 1
@@ -357,7 +361,7 @@
                   kind: Job
                   metadata:
                     name: postgres-backup-verify
-                    namespace: "{{ TARGET_NAMESPACE }}"
+                    namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
                   spec:
                     activeDeadlineSeconds: 60
                     backoffLimit: 0
@@ -380,7 +384,7 @@
               kubernetes.core.k8s_info:
                 kind: Job
                 name: postgres-backup-verify
-                namespace: "{{ TARGET_NAMESPACE }}"
+                namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
               register: verify_job
               until: >-
                 (verify_job.resources[0].status.succeeded | default(0)) == 1
@@ -469,7 +473,7 @@
               kind: PersistentVolumeClaim
               metadata:
                 name: {{ permanent_pvc_name }}
-                namespace: {{ TARGET_NAMESPACE }}
+                namespace: {{ TARGET_RESOURCE_NAMESPACE }}
               spec:
                 accessModes:
                   - ReadWriteOnce
@@ -522,10 +526,10 @@
               echo "No changes to commit"
               exit 0
             fi
-            git commit -m "remediation({{ rr_name }}): migrate {{ TARGET_DEPLOYMENT }} from emptyDir to PVC
+            git commit -m "remediation({{ rr_name }}): migrate {{ TARGET_RESOURCE_NAME }} from emptyDir to PVC
 
             Automated remediation by Kubernaut.
-            Root cause: emptyDir growth on {{ TARGET_DEPLOYMENT }} caused
+            Root cause: emptyDir growth on {{ TARGET_RESOURCE_NAME }} caused
             KubeNodeDiskPressure on node {{ NODE_NAME }}.
             Action: replaced emptyDir volume with PVC ({{ pvc_size }})."
             git push "{{ auth_repo_url }}" {{ git_branch }}
@@ -557,11 +561,11 @@
           ansible.builtin.set_fact:
             argocd_app_name: >-
               {{ (argocd_apps.resources
-                  | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+                  | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
                   | first).metadata.name }}
             argocd_app_namespace: >-
               {{ (argocd_apps.resources
-                  | selectattr('spec.destination.namespace', 'equalto', TARGET_NAMESPACE)
+                  | selectattr('spec.destination.namespace', 'equalto', TARGET_RESOURCE_NAMESPACE)
                   | first).metadata.namespace }}
 
         - name: Wait for ArgoCD to sync the pushed revision (via Gitea webhook)
@@ -582,9 +586,9 @@
         - name: Verify new pod is running with PVC
           kubernetes.core.k8s_info:
             kind: Pod
-            namespace: "{{ TARGET_NAMESPACE }}"
+            namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
             label_selectors:
-              - "app={{ TARGET_DEPLOYMENT }}"
+              - "app={{ TARGET_RESOURCE_NAME }}"
           register: new_pods
           until: >-
             new_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length > 0
@@ -604,7 +608,7 @@
         - ansible.builtin.fail:
             msg: >-
               GitOps migration failed.
-              Backup is preserved at PVC {{ backup_pvc_name }} in {{ TARGET_NAMESPACE }}.
+              Backup is preserved at PVC {{ backup_pvc_name }} in {{ TARGET_RESOURCE_NAMESPACE }}.
               Node {{ NODE_NAME }} remains cordoned. Manual intervention required.
 
     # ══════════════════════════════════════════════════════════════════════
@@ -629,7 +633,7 @@
               kind: Job
               metadata:
                 name: postgres-restore
-                namespace: "{{ TARGET_NAMESPACE }}"
+                namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
               spec:
                 activeDeadlineSeconds: 600
                 backoffLimit: 3
@@ -643,14 +647,14 @@
                           - |
                             set -e
                             echo "Waiting for PostgreSQL to accept connections..."
-                            until pg_isready -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
+                            until pg_isready -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc -U {{ db_user }} -t 5; do
                               echo "  not ready, retrying in 5s..."
                               sleep 5
                             done
                             echo "PostgreSQL is accepting connections. Verifying stability..."
                             for i in 1 2 3; do
                               sleep 5
-                              psql -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                              psql -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc \
                                 -U {{ db_user }} -d {{ db_name }} -c "SELECT 1;" >/dev/null 2>&1 || {
                                 echo "  stability check $i failed, retrying..."
                                 continue
@@ -658,10 +662,10 @@
                               echo "  stability check $i passed"
                             done
                             echo "PostgreSQL is stable. Starting pg_restore..."
-                            pg_restore -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                            pg_restore -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc \
                               -U {{ db_user }} -d {{ db_name }} --clean --if-exists /backup/dump.pgdump
                             echo "Restore complete. Row count:"
-                            psql -h {{ TARGET_DEPLOYMENT }}.{{ TARGET_NAMESPACE }}.svc \
+                            psql -h {{ TARGET_RESOURCE_NAME }}.{{ TARGET_RESOURCE_NAMESPACE }}.svc \
                               -U {{ db_user }} -d {{ db_name }} -c "SELECT count(*) FROM events;"
                         env: "{{ pgpassword_env }}"
                         volumeMounts:
@@ -677,7 +681,7 @@
           kubernetes.core.k8s_info:
             kind: Job
             name: postgres-restore
-            namespace: "{{ TARGET_NAMESPACE }}"
+            namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
           register: restore_job
           until: >-
             (restore_job.resources[0].status.succeeded | default(0)) == 1
@@ -698,7 +702,7 @@
         - ansible.builtin.debug:
             msg: >-
               Restore failed. Backup preserved at PVC {{ backup_pvc_name }}
-              in {{ TARGET_NAMESPACE }}. Manual pg_restore required.
+              in {{ TARGET_RESOURCE_NAMESPACE }}. Manual pg_restore required.
         - ansible.builtin.fail:
             msg: "Phase 4 (restore) failed. See above for backup PVC location."
 
@@ -730,7 +734,7 @@
             state: absent
             kind: "{{ item.kind }}"
             name: "{{ item.name }}"
-            namespace: "{{ TARGET_NAMESPACE }}"
+            namespace: "{{ TARGET_RESOURCE_NAMESPACE }}"
           loop:
             - { kind: Job, name: postgres-backup }
             - { kind: Job, name: postgres-backup-verify }
@@ -742,7 +746,7 @@
           ansible.builtin.debug:
             msg: >-
               Migration complete.
-              Deployment: {{ TARGET_DEPLOYMENT }} in {{ TARGET_NAMESPACE }}
+              Deployment: {{ TARGET_RESOURCE_NAME }} in {{ TARGET_RESOURCE_NAMESPACE }}
               Storage: PVC {{ permanent_pvc_name }} ({{ pvc_size }})
               Node: {{ NODE_NAME }} uncordoned, DiskPressure resolved
               Backup restored: {{ backup_available | default(false) | bool }}

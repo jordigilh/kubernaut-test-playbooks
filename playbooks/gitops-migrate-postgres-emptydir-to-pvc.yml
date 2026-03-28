@@ -503,35 +503,44 @@
                   requests:
                     storage: {{ pvc_size }}
 
-        - name: Patch Deployment YAML -- replace emptyDir with PVC
+        - name: Find target deployment YAML file in repo
+          ansible.builtin.shell: |
+            set -o pipefail
+            grep -rl "name: {{ TARGET_RESOURCE_NAME }}" "{{ repo_manifest_path }}" \
+              | xargs -r grep -l "kind: Deployment" \
+              | head -1
+          args:
+            executable: /bin/bash
+          register: target_deployment_file
+          changed_when: false
+          failed_when: target_deployment_file.rc > 1
+
+        - name: Fail if target deployment YAML not found in repo
+          ansible.builtin.fail:
+            msg: >-
+              Could not find a YAML file containing both 'kind: Deployment' and
+              'name: {{ TARGET_RESOURCE_NAME }}' in {{ repo_manifest_path }}
+          when: target_deployment_file.stdout | length == 0
+
+        - name: Patch target Deployment YAML -- replace emptyDir with PVC
           ansible.builtin.replace:
-            path: "{{ item.path }}"
+            path: "{{ target_deployment_file.stdout }}"
             regexp: 'emptyDir:\s*\{\}'
             replace: |-
               persistentVolumeClaim:
                         claimName: {{ permanent_pvc_name }}
-          loop: "{{ deployment_files.files }}"
-          vars:
-            deployment_files: "{{ lookup('pipe', 'find ' + repo_manifest_path + ' -name \"*.yaml\" -exec grep -l \"kind: Deployment\" {} +') }}"
-          when: false
 
-        - name: Find deployment YAML files in repo
-          ansible.builtin.find:
-            paths: "{{ repo_manifest_path }}"
-            patterns: "*.yaml,*.yml"
-            contains: "kind: Deployment"
-            recurse: true
-          register: deployment_yaml_files
-
-        - name: Patch Deployment YAML -- replace emptyDir with PVC
+        - name: Remove nodeSelector block from target deployment
           ansible.builtin.replace:
-            path: "{{ item.path }}"
-            regexp: 'emptyDir:\s*\{\}'
-            replace: |-
-              persistentVolumeClaim:
-                        claimName: {{ permanent_pvc_name }}
-          loop: "{{ deployment_yaml_files.files }}"
-          when: deployment_yaml_files.matched > 0
+            path: "{{ target_deployment_file.stdout }}"
+            regexp: '^\s*nodeSelector:\n(\s+\S+.*\n)*'
+            replace: ''
+
+        - name: Remove tolerations block from target deployment
+          ansible.builtin.replace:
+            path: "{{ target_deployment_file.stdout }}"
+            regexp: '^\s*tolerations:\n(\s+-\s+.*\n(\s+\w+:.*\n)*)*'
+            replace: ''
 
         - name: Add PVC to kustomization.yaml if present
           ansible.builtin.lineinfile:

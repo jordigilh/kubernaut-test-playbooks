@@ -12,9 +12,7 @@
 #   WFE_NAMESPACE             - WorkflowExecution namespace
 #
 # Required AWX credential env vars:
-#   K8S_AUTH_HOST      - Kubernetes API server URL (injected via AAP K8s credential)
-#   K8S_AUTH_API_KEY   - Bearer token          (injected via AAP K8s credential)
-#   K8S_AUTH_SSL_CA_CERT - Cluster CA cert     (injected via AAP K8s credential)
+#   K8S_AUTH_KUBECONFIG - Path to generated kubeconfig (injected via WE controller K8s credential)
 #   KUBERNAUT_SECRET_GITEA_REPO_CREDS_USERNAME - Git username (injected via dependencies.secrets)
 #   KUBERNAUT_SECRET_GITEA_REPO_CREDS_PASSWORD - Git password (injected via dependencies.secrets)
 #

@@ -24,8 +24,8 @@ Ansible playbooks used by Kubernaut to validate the Ansible execution engine (BR
 
 These playbooks are referenced by Kubernaut's AWX integration via:
 - **AWX Project**: Git SCM pointing to this repository
-- **AWX Job Template**: References a specific playbook path
-- **Kubernaut EngineConfig**: `playbookPath` field in workflow schema
+- **AWX Job Template**: Associates a playbook path with an inventory and credentials
+- **Kubernaut EngineConfig**: `jobTemplateName` field in workflow schema (resolves the AWX job template by name)
 
 ## Parameters
 
@@ -39,13 +39,11 @@ These playbooks are referenced by Kubernaut's AWX integration via:
 
 ### AWX credentials required by GitOps playbooks
 
-The GitOps playbooks use `kubernetes.core` modules that require cluster access. The WE controller attaches an **AAP "OpenShift or Kubernetes API Bearer Token" credential** to the job template, which injects:
+The GitOps playbooks use `kubernetes.core` modules that require cluster access. The WE controller creates an ephemeral AWX credential from its in-cluster identity that injects a kubeconfig file:
 
 | Env var | Description |
 |---------|-------------|
-| `K8S_AUTH_HOST` | Kubernetes API server URL |
-| `K8S_AUTH_API_KEY` | ServiceAccount bearer token |
-| `K8S_AUTH_SSL_CA_CERT` | Cluster CA certificate |
+| `K8S_AUTH_KUBECONFIG` | Path to a generated kubeconfig file containing the API server URL, CA cert, and bearer token |
 
 A **Gitea credential** is also attached (via `dependencies.secrets`), injecting:
 

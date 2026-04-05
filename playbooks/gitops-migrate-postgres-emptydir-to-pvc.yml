@@ -521,24 +521,19 @@
           when: target_deployment_file.stdout | length == 0
 
         - name: Patch target Deployment YAML -- replace emptyDir with PVC
-          ansible.builtin.replace:
-            path: "{{ target_deployment_file.stdout }}"
-            regexp: 'emptyDir:\s*\{\}'
-            replace: |-
-              persistentVolumeClaim:
-                        claimName: {{ permanent_pvc_name }}
+          ansible.builtin.shell: |
+            yq -i '
+              (.spec.template.spec.volumes[] | select(.emptyDir != null)) |=
+              del(.emptyDir) + {"persistentVolumeClaim": {"claimName": "{{ permanent_pvc_name }}"}}
+            ' "{{ target_deployment_file.stdout }}"
 
-        - name: Remove nodeSelector block from target deployment
-          ansible.builtin.replace:
-            path: "{{ target_deployment_file.stdout }}"
-            regexp: '^\s*nodeSelector:\n(\s+\S+.*\n)*'
-            replace: ''
+        - name: Remove nodeSelector from target deployment
+          ansible.builtin.shell: |
+            yq -i 'del(.spec.template.spec.nodeSelector)' "{{ target_deployment_file.stdout }}"
 
-        - name: Remove tolerations block from target deployment
-          ansible.builtin.replace:
-            path: "{{ target_deployment_file.stdout }}"
-            regexp: '^\s*tolerations:\n(\s+-\s+.*\n(\s+\w+:.*\n)*)*'
-            replace: ''
+        - name: Remove tolerations from target deployment
+          ansible.builtin.shell: |
+            yq -i 'del(.spec.template.spec.tolerations)' "{{ target_deployment_file.stdout }}"
 
         - name: Add PVC to kustomization.yaml if present
           ansible.builtin.lineinfile:

@@ -501,39 +501,91 @@
                   requests:
                     storage: {{ pvc_size }}
 
-        - name: Find target deployment YAML file in repo
+        - name: Verify yq is available
+          ansible.builtin.command: yq --version
+          changed_when: false
+
+        - name: Find YAML files in repo
+          ansible.builtin.find:
+            paths: "{{ repo_manifest_path }}"
+            patterns: "*.yaml,*.yml"
+            recurse: true
+          register: repo_yaml_files
+
+        - name: Identify YAML files containing target Deployment
           ansible.builtin.shell: |
-            set -o pipefail
-            grep -rl "name: {{ TARGET_RESOURCE_NAME }}" "{{ repo_manifest_path }}" \
-              | xargs -r grep -l "kind: Deployment" \
-              | head -1
+            matches="$(yq ea 'select(.kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}") | .metadata.name' "{{ item.path }}")"
+            if [ -n "$matches" ]; then
+              echo "{{ item.path }}"
+            fi
           args:
             executable: /bin/bash
-          register: target_deployment_file
+          loop: "{{ repo_yaml_files.files }}"
+          loop_control:
+            label: "{{ item.path }}"
+          register: target_deployment_file_matches
           changed_when: false
-          failed_when: target_deployment_file.rc > 1
 
-        - name: Fail if target deployment YAML not found in repo
-          ansible.builtin.fail:
-            msg: >-
-              Could not find a YAML file containing both 'kind: Deployment' and
-              'name: {{ TARGET_RESOURCE_NAME }}' in {{ repo_manifest_path }}
-          when: target_deployment_file.stdout | length == 0
+        - name: Build list of target deployment files
+          ansible.builtin.set_fact:
+            target_deployment_files: >-
+              {{ target_deployment_file_matches.results
+                 | map(attribute='stdout')
+                 | map('trim')
+                 | reject('equalto', '')
+                 | list }}
+
+        - name: Ensure exactly one target deployment file exists
+          ansible.builtin.assert:
+            that:
+              - target_deployment_files | length == 1
+            fail_msg: >-
+              Expected exactly one Deployment manifest for {{ TARGET_RESOURCE_NAME }}
+              in {{ repo_manifest_path }}, found {{ target_deployment_files | length }}:
+              {{ target_deployment_files | join(', ') }}
+
+        - name: Capture target deployment file path
+          ansible.builtin.set_fact:
+            target_deployment_file: "{{ target_deployment_files[0] }}"
+
+        - name: Ensure target deployment appears exactly once in selected file
+          ansible.builtin.shell: |
+            yq ea 'select(.kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}") | .metadata.name' "{{ target_deployment_file }}" | wc -l
+          args:
+            executable: /bin/bash
+          register: target_deployment_doc_count
+          changed_when: false
+
+        - name: Fail if target deployment appears multiple times in selected file
+          ansible.builtin.assert:
+            that:
+              - target_deployment_doc_count.stdout | trim | int == 1
+            fail_msg: >-
+              Expected exactly one Deployment document named {{ TARGET_RESOURCE_NAME }}
+              in {{ target_deployment_file }}, found
+              {{ target_deployment_doc_count.stdout | trim }}
 
         - name: Patch target Deployment YAML -- replace emptyDir with PVC
           ansible.builtin.shell: |
             yq -i '
-              (.spec.template.spec.volumes[] | select(.emptyDir != null)) |=
-              del(.emptyDir) + {"persistentVolumeClaim": {"claimName": "{{ permanent_pvc_name }}"}}
-            ' "{{ target_deployment_file.stdout }}"
+              if .kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}" then
+                (.spec.template.spec.volumes[]? |=
+                  (if has("emptyDir")
+                  then del(.emptyDir) + {"persistentVolumeClaim": {"claimName": "{{ permanent_pvc_name }}"}}
+                  else .
+                  end))
+              else .
+              end
+            ' "{{ target_deployment_file }}"
 
-        - name: Remove nodeSelector from target deployment
+        - name: Remove nodeSelector and tolerations from target deployment
           ansible.builtin.shell: |
-            yq -i 'del(.spec.template.spec.nodeSelector)' "{{ target_deployment_file.stdout }}"
-
-        - name: Remove tolerations from target deployment
-          ansible.builtin.shell: |
-            yq -i 'del(.spec.template.spec.tolerations)' "{{ target_deployment_file.stdout }}"
+            yq -i '
+              if .kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}" then
+                del(.spec.template.spec.nodeSelector, .spec.template.spec.tolerations)
+              else .
+              end
+            ' "{{ target_deployment_file }}"
 
         - name: Add PVC to kustomization.yaml if present
           ansible.builtin.lineinfile:

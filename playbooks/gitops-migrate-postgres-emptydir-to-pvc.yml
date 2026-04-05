@@ -503,6 +503,7 @@
 
         - name: Identify file containing target Deployment and patch it
           ansible.builtin.shell: |
+            set -euo pipefail
             python3 << 'PYEOF'
             import glob, sys, os
             from ruamel.yaml import YAML
@@ -510,17 +511,18 @@
             yaml = YAML()
             yaml.preserve_quotes = True
 
-            target_name = "{{ TARGET_RESOURCE_NAME }}"
-            pvc_name = "{{ permanent_pvc_name }}"
-            manifest_path = "{{ repo_manifest_path }}"
+            target_name = os.environ["TARGET_RESOURCE_NAME_ENV"]
+            pvc_name = os.environ["PERMANENT_PVC_NAME_ENV"]
+            manifest_path = os.environ["REPO_MANIFEST_PATH_ENV"]
 
             # 1. Find exactly one file containing the target Deployment
             matches = []
             for pattern in ("*.yaml", "*.yml"):
-                for fpath in glob.glob(os.path.join(manifest_path, "**", pattern), recursive=True):
+                for fpath in sorted(glob.glob(os.path.join(manifest_path, "**", pattern), recursive=True)):
                     with open(fpath) as f:
                         for doc in yaml.load_all(f):
-                            if (doc and doc.get("kind") == "Deployment"
+                            if (isinstance(doc, dict)
+                                    and doc.get("kind") == "Deployment"
                                     and doc.get("metadata", {}).get("name") == target_name):
                                 matches.append(fpath)
                                 break
@@ -539,22 +541,31 @@
                 docs = list(yaml.load_all(f))
 
             target_count = 0
+            patched_spec = None
             for doc in docs:
-                if (doc and doc.get("kind") == "Deployment"
+                if (isinstance(doc, dict)
+                        and doc.get("kind") == "Deployment"
                         and doc.get("metadata", {}).get("name") == target_name):
                     target_count += 1
-                    spec = doc["spec"]["template"]["spec"]
+                    spec = (((doc.get("spec") or {}).get("template") or {}).get("spec"))
+                    if not isinstance(spec, dict):
+                        print(f"ERROR: Deployment '{target_name}' in {target_file} has no spec.template.spec map", file=sys.stderr)
+                        sys.exit(1)
 
                     for v in spec.get("volumes", []):
-                        if "emptyDir" in v:
+                        if isinstance(v, dict) and "emptyDir" in v:
                             del v["emptyDir"]
                             v["persistentVolumeClaim"] = {"claimName": pvc_name}
 
                     spec.pop("nodeSelector", None)
                     spec.pop("tolerations", None)
+                    patched_spec = spec
 
             if target_count != 1:
                 print(f"ERROR: Expected 1 Deployment '{target_name}' in {target_file}, found {target_count}", file=sys.stderr)
+                sys.exit(1)
+            if patched_spec is None:
+                print(f"ERROR: Target Deployment '{target_name}' was not patched in {target_file}", file=sys.stderr)
                 sys.exit(1)
 
             # 3. Write back
@@ -562,14 +573,24 @@
                 yaml.dump_all(docs, f)
 
             # 4. Post-patch validation
-            assert "containers" in spec, "containers key missing after patch"
-            assert "nodeSelector" not in spec, "nodeSelector not removed"
-            assert any("persistentVolumeClaim" in v for v in spec.get("volumes", [])), "PVC volume not found"
+            if "containers" not in patched_spec:
+                print("ERROR: containers key missing after patch", file=sys.stderr)
+                sys.exit(1)
+            if "nodeSelector" in patched_spec:
+                print("ERROR: nodeSelector not removed", file=sys.stderr)
+                sys.exit(1)
+            if not any(isinstance(v, dict) and "persistentVolumeClaim" in v for v in patched_spec.get("volumes", [])):
+                print("ERROR: PVC volume not found after patch", file=sys.stderr)
+                sys.exit(1)
 
             print(f"Patched {target_file}: emptyDir→PVC, removed nodeSelector/tolerations")
             PYEOF
           args:
             executable: /bin/bash
+          environment:
+            TARGET_RESOURCE_NAME_ENV: "{{ TARGET_RESOURCE_NAME }}"
+            PERMANENT_PVC_NAME_ENV: "{{ permanent_pvc_name }}"
+            REPO_MANIFEST_PATH_ENV: "{{ repo_manifest_path }}"
           register: patch_result
 
         - name: Log patch result

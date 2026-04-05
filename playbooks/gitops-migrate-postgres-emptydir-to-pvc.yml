@@ -501,91 +501,101 @@
                   requests:
                     storage: {{ pvc_size }}
 
-        - name: Verify yq is available
-          ansible.builtin.command: yq --version
-          changed_when: false
-
-        - name: Find YAML files in repo
-          ansible.builtin.find:
-            paths: "{{ repo_manifest_path }}"
-            patterns: "*.yaml,*.yml"
-            recurse: true
-          register: repo_yaml_files
-
-        - name: Identify YAML files containing target Deployment
+        - name: Identify file containing target Deployment and patch it
           ansible.builtin.shell: |
-            matches="$(yq ea 'select(.kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}") | .metadata.name' "{{ item.path }}")"
-            if [ -n "$matches" ]; then
-              echo "{{ item.path }}"
-            fi
+            set -euo pipefail
+            python3 << 'PYEOF'
+            import glob, sys, os
+            from ruamel.yaml import YAML
+
+            yaml = YAML()
+            yaml.preserve_quotes = True
+
+            target_name = os.environ["TARGET_RESOURCE_NAME_ENV"]
+            pvc_name = os.environ["PERMANENT_PVC_NAME_ENV"]
+            manifest_path = os.environ["REPO_MANIFEST_PATH_ENV"]
+
+            # 1. Find exactly one file containing the target Deployment
+            matches = []
+            for pattern in ("*.yaml", "*.yml"):
+                for fpath in sorted(glob.glob(os.path.join(manifest_path, "**", pattern), recursive=True)):
+                    with open(fpath) as f:
+                        for doc in yaml.load_all(f):
+                            if (isinstance(doc, dict)
+                                    and doc.get("kind") == "Deployment"
+                                    and doc.get("metadata", {}).get("name") == target_name):
+                                matches.append(fpath)
+                                break
+
+            if len(matches) == 0:
+                print(f"ERROR: No YAML file contains Deployment '{target_name}' in {manifest_path}", file=sys.stderr)
+                sys.exit(1)
+            if len(matches) > 1:
+                print(f"ERROR: Multiple files contain Deployment '{target_name}': {matches}", file=sys.stderr)
+                sys.exit(1)
+
+            target_file = matches[0]
+
+            # 2. Load all docs, patch only the target Deployment
+            with open(target_file) as f:
+                docs = list(yaml.load_all(f))
+
+            target_count = 0
+            patched_spec = None
+            for doc in docs:
+                if (isinstance(doc, dict)
+                        and doc.get("kind") == "Deployment"
+                        and doc.get("metadata", {}).get("name") == target_name):
+                    target_count += 1
+                    spec = (((doc.get("spec") or {}).get("template") or {}).get("spec"))
+                    if not isinstance(spec, dict):
+                        print(f"ERROR: Deployment '{target_name}' in {target_file} has no spec.template.spec map", file=sys.stderr)
+                        sys.exit(1)
+
+                    for v in spec.get("volumes", []):
+                        if isinstance(v, dict) and "emptyDir" in v:
+                            del v["emptyDir"]
+                            v["persistentVolumeClaim"] = {"claimName": pvc_name}
+
+                    spec.pop("nodeSelector", None)
+                    spec.pop("tolerations", None)
+                    patched_spec = spec
+
+            if target_count != 1:
+                print(f"ERROR: Expected 1 Deployment '{target_name}' in {target_file}, found {target_count}", file=sys.stderr)
+                sys.exit(1)
+            if patched_spec is None:
+                print(f"ERROR: Target Deployment '{target_name}' was not patched in {target_file}", file=sys.stderr)
+                sys.exit(1)
+
+            # 3. Write back
+            with open(target_file, "w") as f:
+                yaml.dump_all(docs, f)
+
+            # 4. Post-patch validation
+            if "containers" not in patched_spec:
+                print("ERROR: containers key missing after patch", file=sys.stderr)
+                sys.exit(1)
+            if "nodeSelector" in patched_spec:
+                print("ERROR: nodeSelector not removed", file=sys.stderr)
+                sys.exit(1)
+            if not any(isinstance(v, dict) and "persistentVolumeClaim" in v for v in patched_spec.get("volumes", [])):
+                print("ERROR: PVC volume not found after patch", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"Patched {target_file}: emptyDir→PVC, removed nodeSelector/tolerations")
+            PYEOF
           args:
             executable: /bin/bash
-          loop: "{{ repo_yaml_files.files }}"
-          loop_control:
-            label: "{{ item.path }}"
-          register: target_deployment_file_matches
-          changed_when: false
+          environment:
+            TARGET_RESOURCE_NAME_ENV: "{{ TARGET_RESOURCE_NAME }}"
+            PERMANENT_PVC_NAME_ENV: "{{ permanent_pvc_name }}"
+            REPO_MANIFEST_PATH_ENV: "{{ repo_manifest_path }}"
+          register: patch_result
 
-        - name: Build list of target deployment files
-          ansible.builtin.set_fact:
-            target_deployment_files: >-
-              {{ target_deployment_file_matches.results
-                 | map(attribute='stdout')
-                 | map('trim')
-                 | reject('equalto', '')
-                 | list }}
-
-        - name: Ensure exactly one target deployment file exists
-          ansible.builtin.assert:
-            that:
-              - target_deployment_files | length == 1
-            fail_msg: >-
-              Expected exactly one Deployment manifest for {{ TARGET_RESOURCE_NAME }}
-              in {{ repo_manifest_path }}, found {{ target_deployment_files | length }}:
-              {{ target_deployment_files | join(', ') }}
-
-        - name: Capture target deployment file path
-          ansible.builtin.set_fact:
-            target_deployment_file: "{{ target_deployment_files[0] }}"
-
-        - name: Ensure target deployment appears exactly once in selected file
-          ansible.builtin.shell: |
-            yq ea 'select(.kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}") | .metadata.name' "{{ target_deployment_file }}" | wc -l
-          args:
-            executable: /bin/bash
-          register: target_deployment_doc_count
-          changed_when: false
-
-        - name: Fail if target deployment appears multiple times in selected file
-          ansible.builtin.assert:
-            that:
-              - target_deployment_doc_count.stdout | trim | int == 1
-            fail_msg: >-
-              Expected exactly one Deployment document named {{ TARGET_RESOURCE_NAME }}
-              in {{ target_deployment_file }}, found
-              {{ target_deployment_doc_count.stdout | trim }}
-
-        - name: Patch target Deployment YAML -- replace emptyDir with PVC
-          ansible.builtin.shell: |
-            yq -i '
-              if .kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}" then
-                (.spec.template.spec.volumes[]? |=
-                  (if has("emptyDir")
-                  then del(.emptyDir) + {"persistentVolumeClaim": {"claimName": "{{ permanent_pvc_name }}"}}
-                  else .
-                  end))
-              else .
-              end
-            ' "{{ target_deployment_file }}"
-
-        - name: Remove nodeSelector and tolerations from target deployment
-          ansible.builtin.shell: |
-            yq -i '
-              if .kind == "Deployment" and .metadata.name == "{{ TARGET_RESOURCE_NAME }}" then
-                del(.spec.template.spec.nodeSelector, .spec.template.spec.tolerations)
-              else .
-              end
-            ' "{{ target_deployment_file }}"
+        - name: Log patch result
+          ansible.builtin.debug:
+            msg: "{{ patch_result.stdout }}"
 
         - name: Add PVC to kustomization.yaml if present
           ansible.builtin.lineinfile:

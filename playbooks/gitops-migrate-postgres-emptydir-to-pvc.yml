@@ -52,6 +52,41 @@
           - WFE_NAMESPACE is defined and WFE_NAMESPACE | length > 0
         fail_msg: "Missing required extra_vars"
 
+    # Resolve short hostname to FQDN if needed. The LLM may return a short
+    # name (e.g. "dev-worker-0") but OCP nodes use FQDN metadata names
+    # (e.g. "dev-worker-0.redhat-internal.com").
+    - name: Check if NODE_NAME exists as-is
+      kubernetes.core.k8s_info:
+        kind: Node
+        name: "{{ NODE_NAME }}"
+      register: node_check
+      ignore_errors: true
+
+    - name: Resolve FQDN if short name not found
+      when: node_check.resources | default([]) | length == 0
+      block:
+        - name: List all node names
+          kubernetes.core.k8s_info:
+            kind: Node
+          register: all_nodes
+
+        - name: Find FQDN matching short name
+          ansible.builtin.set_fact:
+            NODE_NAME: >-
+              {{ (all_nodes.resources
+                  | map(attribute='metadata.name')
+                  | select('match', '^' ~ NODE_NAME ~ '\\.') | first) }}
+          when: all_nodes.resources | map(attribute='metadata.name') | select('match', '^' ~ NODE_NAME ~ '\\.') | list | length > 0
+
+        - name: Log FQDN resolution
+          ansible.builtin.debug:
+            msg: "Resolved NODE_NAME to FQDN: {{ NODE_NAME }}"
+
+    - name: "Node {{ NODE_NAME }} not found"
+      ansible.builtin.fail:
+        msg: "Node '{{ NODE_NAME }}' not found (even after FQDN resolution)"
+      when: node_check.resources | default([]) | length == 0 and (all_nodes is not defined or all_nodes.resources | map(attribute='metadata.name') | select('match', '^' ~ NODE_NAME ~ '\\.') | list | length == 0)
+
     # ── Discover deployment, image, and DB credentials ──────────────────────
 
     - name: Get target deployment

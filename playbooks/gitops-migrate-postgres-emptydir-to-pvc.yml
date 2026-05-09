@@ -70,13 +70,18 @@
             kind: Node
           register: all_nodes
 
-        - name: Find FQDN matching short name
+        - name: Build FQDN candidates matching short name
           ansible.builtin.set_fact:
-            NODE_NAME: >-
-              {{ (all_nodes.resources
-                  | map(attribute='metadata.name')
-                  | select('match', '^' ~ NODE_NAME ~ '\\.') | first) }}
-          when: all_nodes.resources | map(attribute='metadata.name') | select('match', '^' ~ NODE_NAME ~ '\\.') | list | length > 0
+            _fqdn_matches: >-
+              {{ all_nodes.resources
+                 | map(attribute='metadata.name')
+                 | select('match', '^' ~ NODE_NAME ~ '(\\..*)?$')
+                 | list }}
+
+        - name: Set NODE_NAME to FQDN match
+          ansible.builtin.set_fact:
+            NODE_NAME: "{{ _fqdn_matches[0] }}"
+          when: _fqdn_matches | length > 0
 
         - name: Log FQDN resolution
           ansible.builtin.debug:
@@ -85,7 +90,9 @@
     - name: "Node {{ NODE_NAME }} not found"
       ansible.builtin.fail:
         msg: "Node '{{ NODE_NAME }}' not found (even after FQDN resolution)"
-      when: node_check.resources | default([]) | length == 0 and (all_nodes is not defined or all_nodes.resources | map(attribute='metadata.name') | select('match', '^' ~ NODE_NAME ~ '\\.') | list | length == 0)
+      when: >-
+        node_check.resources | default([]) | length == 0
+        and (_fqdn_matches is not defined or _fqdn_matches | length == 0)
 
     # ── Discover deployment, image, and DB credentials ──────────────────────
 
